@@ -227,3 +227,6 @@ endif()
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
 endif()
+
+# SoH3D oracle tool (texture-decode comparison vs the SoH3D converter).
+add_subdirectory(soh3d_oracle)
