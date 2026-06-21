@@ -193,6 +193,17 @@ void RPCServer::HandleTouch(Packet& packet, u32 active, u32 xy) {
     packet.SendReply();
 }
 
+// SoH3D oracle (#89): save (op=0) / load (op=1) an Azahar savestate slot. Queued on the emu thread
+// via SendSignal (same path the GUI uses), so RE iterations can reload an in-game scene instantly.
+void RPCServer::HandleSavestate(Packet& packet, u32 slot, u32 op) {
+    const auto sig = (op == 0) ? Core::System::Signal::Save : Core::System::Signal::Load;
+    const bool ok = system.SendSignal(sig, slot);
+    u32 status = ok ? 1u : 0u;
+    std::memcpy(packet.GetPacketData().data(), &status, sizeof(status));
+    packet.SetPacketDataSize(sizeof(status));
+    packet.SendReply();
+}
+
 bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
     if (packet_header.version <= CURRENT_VERSION) {
         switch (packet_header.packet_type) {
@@ -203,6 +214,7 @@ bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
         case PacketType::Screenshot:
         case PacketType::Input:
         case PacketType::Touch:
+        case PacketType::Savestate:
             if (packet_header.packet_size >= (sizeof(u32) * 2)) {
                 return true;
             }
