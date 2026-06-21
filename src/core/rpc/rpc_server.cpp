@@ -9,6 +9,7 @@
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/hle/kernel/process.h"
+#include "core/hle/service/hid/hid.h"
 #include "core/memory.h"
 #include "core/rpc/packet.h"
 #include "core/rpc/rpc_server.h"
@@ -170,6 +171,19 @@ void RPCServer::HandleScreenshot(Packet& packet, u32 res_scale, std::span<const 
     packet.SendReply();
 }
 
+// SoH3D oracle (#89): set the held 3DS pad for headless input scripting. circle: bit24=active,
+// [15:8]=cx%, [7:0]=cy% (signed -100..100, scaled to the circle-pad range ~0x9A).
+void RPCServer::HandleInput(Packet& packet, u32 buttons, u32 circle) {
+    const bool circle_active = (circle >> 24) & 1;
+    const s8 cx_pct = static_cast<s8>((circle >> 8) & 0xFF);
+    const s8 cy_pct = static_cast<s8>(circle & 0xFF);
+    const s16 cx = static_cast<s16>(cx_pct * 0x9A / 100);
+    const s16 cy = static_cast<s16>(cy_pct * 0x9A / 100);
+    Service::HID::SetInjectedPad(buttons, circle_active, cx, cy);
+    packet.SetPacketDataSize(0);
+    packet.SendReply();
+}
+
 bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
     if (packet_header.version <= CURRENT_VERSION) {
         switch (packet_header.packet_type) {
@@ -178,6 +192,7 @@ bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
         case PacketType::ProcessList:
         case PacketType::SetGetProcess:
         case PacketType::Screenshot:
+        case PacketType::Input:
             if (packet_header.packet_size >= (sizeof(u32) * 2)) {
                 return true;
             }
@@ -228,6 +243,10 @@ void RPCServer::HandleSingleRequest(std::unique_ptr<Packet> request_packet) {
                 HandleScreenshot(*request_packet, arg1, packet_data.subspan(sizeof(u32) * 2, arg2));
                 success = true;
             }
+            break;
+        case PacketType::Input:
+            HandleInput(*request_packet, arg1, arg2);
+            success = true;
             break;
         default:
             break;

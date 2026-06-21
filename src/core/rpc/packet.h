@@ -20,6 +20,10 @@ enum class PacketType : u32 {
     // SoH3D oracle (#89): capture the next rendered frame to a PPM file on the host.
     // arg1 = resolution scale (0 = current), arg2 = path byte length; path bytes follow the 8B args.
     Screenshot = 5,
+    // SoH3D oracle (#89): set the HELD 3DS pad state for headless input scripting.
+    // arg1 = PadState button bits; arg2 = circle pad: bit24 = active, [15:8] = cx %, [7:0] = cy %
+    // (signed -100..100, scaled to circle-pad range). Persists until the next Input packet.
+    Input = 6,
 };
 
 struct PacketHeader {

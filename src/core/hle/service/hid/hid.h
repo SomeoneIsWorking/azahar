@@ -405,6 +405,14 @@ private:
 std::shared_ptr<Module> GetModule(Core::System& system);
 
 void InstallInterfaces(Core::System& system);
+
+// SoH3D oracle (#89): RPC-driven input injection for headless scripting. Sets the currently-HELD
+// 3DS pad state that UpdatePadCallback ORs into the real input each frame (real input is empty when
+// headless). `buttons` = PadState hex bits (a=1<<0, b=1<<1, select=1<<2, start=1<<3, right=1<<4,
+// left=1<<5, up=1<<6, down=1<<7, r=1<<8, l=1<<9, x=1<<10, y=1<<11). When `circle_active`, the circle
+// pad is forced to (cx,cy) in raw units (~[-0x9A,0x9A]). Call with buttons=0, circle_active=false to
+// release everything. A tap = set bits, wait a few frames, then release.
+void SetInjectedPad(u32 buttons, bool circle_active, s16 cx, s16 cy);
 } // namespace Service::HID
 
 SERVICE_CONSTRUCT(Service::HID::Module)

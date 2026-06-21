@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <numeric>
 #include <boost/serialization/array.hpp>
@@ -29,6 +30,22 @@ SERVICE_CONSTRUCT_IMPL(Service::HID::Module)
 SERIALIZE_EXPORT_IMPL(Service::HID::Module)
 
 namespace Service::HID {
+
+// SoH3D oracle (#89): RPC-injected held input, merged in UpdatePadCallback. Atomic so the RPC thread
+// can set it while the emu thread reads it.
+namespace {
+std::atomic<u32> g_injected_buttons{0};
+std::atomic<bool> g_injected_circle_active{false};
+std::atomic<s32> g_injected_circle_x{0};
+std::atomic<s32> g_injected_circle_y{0};
+} // namespace
+
+void SetInjectedPad(u32 buttons, bool circle_active, s16 cx, s16 cy) {
+    g_injected_buttons.store(buttons);
+    g_injected_circle_active.store(circle_active);
+    g_injected_circle_x.store(cx);
+    g_injected_circle_y.store(cy);
+}
 
 template <class Archive>
 void Module::serialize(Archive& ar, const unsigned int file_version) {
@@ -239,6 +256,14 @@ void Module::UpdatePadCallback(std::uintptr_t user_data, s64 cycles_late) {
         circle_pad_old_x.push_back(circle_pad_new_x);
         circle_pad_old_y.erase(circle_pad_old_y.begin());
         circle_pad_old_y.push_back(circle_pad_new_y);
+
+        // SoH3D oracle (#89): merge RPC-injected held input (headless scripting). OR the injected
+        // buttons into the real state, and override the circle pad when an injection is active.
+        state.hex |= g_injected_buttons.load();
+        if (g_injected_circle_active.load()) {
+            circle_pad_x = static_cast<s16>(g_injected_circle_x.load());
+            circle_pad_y = static_cast<s16>(g_injected_circle_y.load());
+        }
 
         system.Movie().HandlePadAndCircleStatus(state, circle_pad_x, circle_pad_y);
 
