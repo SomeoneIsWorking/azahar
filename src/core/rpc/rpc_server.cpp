@@ -139,8 +139,9 @@ void RPCServer::HandleScreenshot(Packet& packet, u32 res_scale, std::span<const 
     renderer.RequestScreenshot(
         pixels.data(),
         [&](bool invert_y) {
-            // RequestScreenshot fills RGBA8888 in memory order R,G,B,A (Azahar screenshot buffer).
-            // Write a PPM (P6, RGB), flipping rows when invert_y so the image is upright.
+            // The renderer fills the buffer via glReadPixels(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV),
+            // i.e. memory byte order is B,G,R,A. Emit PPM (P6, RGB) as R=[2] G=[1] B=[0], flipping
+            // rows when invert_y so the image is upright.
             std::ofstream f(out_path, std::ios::binary);
             bool ok = static_cast<bool>(f);
             if (ok) {
@@ -149,9 +150,9 @@ void RPCServer::HandleScreenshot(Packet& packet, u32 res_scale, std::span<const 
                     const u32 sy = invert_y ? (layout.height - 1 - y) : y;
                     const u8* row = pixels.data() + static_cast<size_t>(sy) * layout.width * 4;
                     for (u32 x = 0; x < layout.width; x++) {
-                        f.put(static_cast<char>(row[x * 4 + 0]));
-                        f.put(static_cast<char>(row[x * 4 + 1]));
-                        f.put(static_cast<char>(row[x * 4 + 2]));
+                        f.put(static_cast<char>(row[x * 4 + 2])); // R
+                        f.put(static_cast<char>(row[x * 4 + 1])); // G
+                        f.put(static_cast<char>(row[x * 4 + 0])); // B
                     }
                 }
             }
