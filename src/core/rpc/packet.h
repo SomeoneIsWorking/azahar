@@ -24,6 +24,9 @@ enum class PacketType : u32 {
     // arg1 = PadState button bits; arg2 = circle pad: bit24 = active, [15:8] = cx %, [7:0] = cy %
     // (signed -100..100, scaled to circle-pad range). Persists until the next Input packet.
     Input = 6,
+    // SoH3D oracle (#89): set the held bottom-screen touch. arg1 = active (0/1),
+    // arg2 = (x << 16) | y in pixels (x 0..319, y 0..239). Persists until the next Touch packet.
+    Touch = 7,
 };
 
 struct PacketHeader {

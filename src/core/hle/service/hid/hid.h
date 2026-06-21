@@ -413,6 +413,10 @@ void InstallInterfaces(Core::System& system);
 // pad is forced to (cx,cy) in raw units (~[-0x9A,0x9A]). Call with buttons=0, circle_active=false to
 // release everything. A tap = set bits, wait a few frames, then release.
 void SetInjectedPad(u32 buttons, bool circle_active, s16 cx, s16 cy);
+
+// SoH3D oracle (#89): inject a held touch on the bottom screen (pixels, 0..319 x, 0..239 y).
+// active=false releases. Needed because OoT3D menus (file select, etc.) are touch-driven.
+void SetInjectedTouch(bool active, u16 x, u16 y);
 } // namespace Service::HID
 
 SERVICE_CONSTRUCT(Service::HID::Module)

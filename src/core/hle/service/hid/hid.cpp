@@ -38,6 +38,9 @@ std::atomic<u32> g_injected_buttons{0};
 std::atomic<bool> g_injected_circle_active{false};
 std::atomic<s32> g_injected_circle_x{0};
 std::atomic<s32> g_injected_circle_y{0};
+std::atomic<bool> g_injected_touch_active{false};
+std::atomic<u32> g_injected_touch_x{0};
+std::atomic<u32> g_injected_touch_y{0};
 } // namespace
 
 void SetInjectedPad(u32 buttons, bool circle_active, s16 cx, s16 cy) {
@@ -45,6 +48,12 @@ void SetInjectedPad(u32 buttons, bool circle_active, s16 cx, s16 cy) {
     g_injected_circle_active.store(circle_active);
     g_injected_circle_x.store(cx);
     g_injected_circle_y.store(cy);
+}
+
+void SetInjectedTouch(bool active, u16 x, u16 y) {
+    g_injected_touch_x.store(x);
+    g_injected_touch_y.store(y);
+    g_injected_touch_active.store(active);
 }
 
 template <class Archive>
@@ -317,6 +326,13 @@ void Module::UpdatePadCallback(std::uintptr_t user_data, s64 cycles_late) {
         touch_entry.x = static_cast<u16>(x * Core::kScreenBottomWidth);
         touch_entry.y = static_cast<u16>(y * Core::kScreenBottomHeight);
         touch_entry.valid.Assign(pressed ? 1 : 0);
+
+        // SoH3D oracle (#89): override with RPC-injected touch (OoT3D menus are touch-driven).
+        if (g_injected_touch_active.load()) {
+            touch_entry.x = static_cast<u16>(g_injected_touch_x.load());
+            touch_entry.y = static_cast<u16>(g_injected_touch_y.load());
+            touch_entry.valid.Assign(1);
+        }
 
         system.Movie().HandleTouchStatus(touch_entry);
     }

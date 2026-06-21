@@ -184,6 +184,14 @@ void RPCServer::HandleInput(Packet& packet, u32 buttons, u32 circle) {
     packet.SendReply();
 }
 
+// SoH3D oracle (#89): set the held bottom-screen touch (xy = (x<<16)|y in pixels).
+void RPCServer::HandleTouch(Packet& packet, u32 active, u32 xy) {
+    Service::HID::SetInjectedTouch(active != 0, static_cast<u16>((xy >> 16) & 0xFFFF),
+                                   static_cast<u16>(xy & 0xFFFF));
+    packet.SetPacketDataSize(0);
+    packet.SendReply();
+}
+
 bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
     if (packet_header.version <= CURRENT_VERSION) {
         switch (packet_header.packet_type) {
@@ -193,6 +201,7 @@ bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
         case PacketType::SetGetProcess:
         case PacketType::Screenshot:
         case PacketType::Input:
+        case PacketType::Touch:
             if (packet_header.packet_size >= (sizeof(u32) * 2)) {
                 return true;
             }
@@ -246,6 +255,10 @@ void RPCServer::HandleSingleRequest(std::unique_ptr<Packet> request_packet) {
             break;
         case PacketType::Input:
             HandleInput(*request_packet, arg1, arg2);
+            success = true;
+            break;
+        case PacketType::Touch:
+            HandleTouch(*request_packet, arg1, arg2);
             success = true;
             break;
         default:

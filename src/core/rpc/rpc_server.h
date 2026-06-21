@@ -33,6 +33,7 @@ private:
     void HandleSetGetProcess(Packet& packet, u32 operation, u32 process_id);
     void HandleScreenshot(Packet& packet, u32 res_scale, std::span<const u8> path);
     void HandleInput(Packet& packet, u32 buttons, u32 circle);
+    void HandleTouch(Packet& packet, u32 active, u32 xy);
     bool ValidatePacket(const PacketHeader& packet_header);
     void HandleSingleRequest(std::unique_ptr<Packet> request);
     void HandleRequestsLoop(std::stop_token stop_token);
