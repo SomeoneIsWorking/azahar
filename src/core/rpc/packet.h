@@ -17,6 +17,9 @@ enum class PacketType : u32 {
     WriteMemory = 2,
     ProcessList = 3,
     SetGetProcess = 4,
+    // SoH3D oracle (#89): capture the next rendered frame to a PPM file on the host.
+    // arg1 = resolution scale (0 = current), arg2 = path byte length; path bytes follow the 8B args.
+    Screenshot = 5,
 };
 
 struct PacketHeader {

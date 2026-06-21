@@ -2,12 +2,18 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <fstream>
+#include <future>
+#include <string>
 #include "common/logging/log.h"
 #include "core/core.h"
+#include "core/frontend/framebuffer_layout.h"
 #include "core/hle/kernel/process.h"
 #include "core/memory.h"
 #include "core/rpc/packet.h"
 #include "core/rpc/rpc_server.h"
+#include "video_core/gpu.h"
+#include "video_core/renderer_base.h"
 
 namespace Core::RPC {
 
@@ -115,6 +121,55 @@ void RPCServer::HandleSetGetProcess(Packet& packet, u32 operation, u32 process_i
     packet.SendReply();
 }
 
+// SoH3D oracle (#89): capture the next rendered frame to a PPM file. Runs on the RPC thread; the
+// renderer fills our buffer on its next frame (emulation keeps running, independent of this thread),
+// so we block on a promise set by the completion callback, then write the PPM ourselves (no Qt).
+void RPCServer::HandleScreenshot(Packet& packet, u32 res_scale, std::span<const u8> path) {
+    std::string out_path(reinterpret_cast<const char*>(path.data()), path.size());
+    auto& renderer = system.GPU().Renderer();
+    if (res_scale == 0) {
+        res_scale = renderer.GetResolutionScaleFactor();
+    }
+    const auto layout = Layout::FrameLayoutFromResolutionScale(res_scale, false);
+    std::vector<u8> pixels(static_cast<size_t>(layout.width) * layout.height * 4);
+
+    std::promise<bool> done;
+    auto fut = done.get_future();
+    renderer.RequestScreenshot(
+        pixels.data(),
+        [&](bool invert_y) {
+            // RequestScreenshot fills RGBA8888 in memory order R,G,B,A (Azahar screenshot buffer).
+            // Write a PPM (P6, RGB), flipping rows when invert_y so the image is upright.
+            std::ofstream f(out_path, std::ios::binary);
+            bool ok = static_cast<bool>(f);
+            if (ok) {
+                f << "P6\n" << layout.width << " " << layout.height << "\n255\n";
+                for (u32 y = 0; y < layout.height; y++) {
+                    const u32 sy = invert_y ? (layout.height - 1 - y) : y;
+                    const u8* row = pixels.data() + static_cast<size_t>(sy) * layout.width * 4;
+                    for (u32 x = 0; x < layout.width; x++) {
+                        f.put(static_cast<char>(row[x * 4 + 0]));
+                        f.put(static_cast<char>(row[x * 4 + 1]));
+                        f.put(static_cast<char>(row[x * 4 + 2]));
+                    }
+                }
+            }
+            done.set_value(ok);
+        },
+        layout);
+
+    bool ok = false;
+    if (fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+        ok = fut.get();
+    } else {
+        LOG_ERROR(RPC_Server, "Screenshot timed out (no frame rendered?)");
+    }
+    u32 status = ok ? 1u : 0u;
+    std::memcpy(packet.GetPacketData().data(), &status, sizeof(status));
+    packet.SetPacketDataSize(sizeof(status));
+    packet.SendReply();
+}
+
 bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
     if (packet_header.version <= CURRENT_VERSION) {
         switch (packet_header.packet_type) {
@@ -122,6 +177,7 @@ bool RPCServer::ValidatePacket(const PacketHeader& packet_header) {
         case PacketType::WriteMemory:
         case PacketType::ProcessList:
         case PacketType::SetGetProcess:
+        case PacketType::Screenshot:
             if (packet_header.packet_size >= (sizeof(u32) * 2)) {
                 return true;
             }
@@ -165,6 +221,13 @@ void RPCServer::HandleSingleRequest(std::unique_ptr<Packet> request_packet) {
         case PacketType::SetGetProcess:
             HandleSetGetProcess(*request_packet, arg1, arg2);
             success = true;
+            break;
+        case PacketType::Screenshot:
+            // arg1 = res_scale, arg2 = path length; path bytes follow the two u32 args.
+            if (arg2 > 0 && arg2 <= MAX_PACKET_DATA_SIZE - (sizeof(u32) * 2)) {
+                HandleScreenshot(*request_packet, arg1, packet_data.subspan(sizeof(u32) * 2, arg2));
+                success = true;
+            }
             break;
         default:
             break;
