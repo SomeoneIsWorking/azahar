@@ -544,7 +544,17 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
 
     exclusive_monitor = MakeExclusiveMonitor(*memory, num_cores);
     cpu_cores.reserve(num_cores);
-    if (Settings::values.use_cpu_jit) {
+    // Soh3d RE hook: SOH3D_CPU_INTERPRETER=1 forces the interpreter path
+    // (ARM_DynCom) so every guest STR goes through MemoryWrite8/16/32 →
+    // MemorySystem::Write<T> → the inline memlog. Dynarmic's JIT
+    // otherwise compiles stores as direct memcpy via the page_table
+    // pointer array, bypassing MemorySystem::Write entirely (verified
+    // via 0-hits memlog runs). Slower per-frame but essential for the
+    // title-cs writer-PC surfacing pass.
+    const char* force_interp = std::getenv("SOH3D_CPU_INTERPRETER");
+    const bool use_jit = Settings::values.use_cpu_jit &&
+                         !(force_interp && force_interp[0] == '1');
+    if (use_jit) {
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
         for (u32 i = 0; i < num_cores; ++i) {
             cpu_cores.push_back(std::make_shared<ARM_Dynarmic>(

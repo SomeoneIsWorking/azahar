@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdio>
 #include <boost/container/static_vector.hpp>
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -227,6 +228,20 @@ void RasterizerSoftware::MakeScreenCoords(Vertex& vtx) {
     vtx.screenpos[2] = vtx.pos.z * inv_w;
 }
 
+// TASK16 draw log — when soh3d_draw_log_path is non-empty, every triangle
+// this rasterizer processes is appended to that path as CSV:
+//   phys_tex0,phys_tex1,phys_tex2, blend_rgb_src,blend_rgb_dst,eq, blend_a_src,blend_a_dst,eq_a,
+//   v0x,v0y, v1x,v1y, v2x,v2y, w,h
+// The harness enables logging once it hits settled title, disables after one
+// frame, then greps the log for the moon draws (identified by texture VA
+// matching the loaded fine_moon0/fine_lensflare region).
+extern "C" char soh3d_draw_log_path[256] = "";
+extern "C" int soh3d_draw_log_active = 0;
+// Defined by pica_core.cpp (AZAHAR_PATCH.md Patch 7). The draw counter is
+// incremented immediately before DrawArrays, so raster records use index - 1
+// to match the pre-increment `draw n=` identity emitted by vsuni_log.
+extern "C" int soh3d_draw_index;
+
 void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, const Vertex& v2,
                                          bool reversed) {
     MICROPROFILE_SCOPE(GPU_Rasterization);
@@ -242,6 +257,105 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
         screen_to_rasterizer_coords(v1.screenpos),
         screen_to_rasterizer_coords(v2.screenpos),
     };
+    const int oracle_draw_index = soh3d_draw_index - 1;
+
+    // TASK16 draw log (kept lightweight — no barrier, thread-local guard).
+    if (soh3d_draw_log_active && soh3d_draw_log_path[0]) {
+        FILE* f = std::fopen(soh3d_draw_log_path, "a");
+        if (f) {
+            const auto texs = regs.texturing.GetTextures();
+            const auto out = regs.framebuffer.output_merger;
+            const u32 t0 = texs[0].enabled ? texs[0].config.GetPhysicalAddress() : 0u;
+            const u32 t1 = texs[1].enabled ? texs[1].config.GetPhysicalAddress() : 0u;
+            const u32 t2 = texs[2].enabled ? texs[2].config.GetPhysicalAddress() : 0u;
+            const auto& blend = out.alpha_blending;
+            const u32 cbuf = regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
+            const u32 vbuf = regs.pipeline.vertex_attributes.GetPhysicalBaseAddress();
+            std::fprintf(
+                f,
+                "tri draw=%d cbuf=%08x vbuf=%08x tex0=%08x tex1=%08x tex2=%08x "
+                "blendRGB=%d,%d,%d blendA=%d,%d,%d "
+                "sxy=(%.1f,%.1f),(%.1f,%.1f),(%.1f,%.1f) "
+                "w=%d h=%d fmt=%d "
+                "c0=(%.3f,%.3f,%.3f,%.3f) c1=(%.3f,%.3f,%.3f,%.3f) c2=(%.3f,%.3f,%.3f,%.3f) "
+                "n0=(%.3f,%.3f,%.3f) "
+                "lit_dis=%d\n",
+                oracle_draw_index, (unsigned)cbuf, (unsigned)vbuf, (unsigned)t0, (unsigned)t1,
+                (unsigned)t2, (int)blend.factor_source_rgb.Value(),
+                (int)blend.factor_dest_rgb.Value(), (int)blend.blend_equation_rgb.Value(),
+                (int)blend.factor_source_a.Value(), (int)blend.factor_dest_a.Value(),
+                (int)blend.blend_equation_a.Value(), (double)(u16)vtxpos[0].x / 16.0,
+                (double)(u16)vtxpos[0].y / 16.0, (double)(u16)vtxpos[1].x / 16.0,
+                (double)(u16)vtxpos[1].y / 16.0, (double)(u16)vtxpos[2].x / 16.0,
+                (double)(double)(u16)vtxpos[2].y / 16.0, (int)texs[0].config.width,
+                (int)texs[0].config.height, (int)texs[0].format, (double)v0.color.r().ToFloat32(),
+                (double)v0.color.g().ToFloat32(), (double)v0.color.b().ToFloat32(),
+                (double)v0.color.a().ToFloat32(), (double)v1.color.r().ToFloat32(),
+                (double)v1.color.g().ToFloat32(), (double)v1.color.b().ToFloat32(),
+                (double)v1.color.a().ToFloat32(), (double)v2.color.r().ToFloat32(),
+                (double)v2.color.g().ToFloat32(), (double)v2.color.b().ToFloat32(),
+                (double)v2.color.a().ToFloat32(), (double)v0.quat.x.ToFloat32(),
+                (double)v0.quat.y.ToFloat32(), (double)v0.quat.z.ToFloat32(),
+                (int)regs.lighting.disable.Value());
+            // TASK16 #146: dump vertex-shader uniform float registers f[0..95]
+            // for the moon draws — the model-space quad is a fixed unit square
+            // for all 3 layers (confirmed via vbuf read), so the halo/disc
+            // scale difference must live in a per-draw uniform (model/scale
+            // matrix), not vertex data.
+            if (t0 == 0x20906a80u || t0 == 0x2090ec80u || t0 == 0x20910e80u) {
+                std::fprintf(f, "  vsuniforms tex0=%08x", (unsigned)t0);
+                for (int ui = 0; ui < 96; ++ui) {
+                    const auto& u = pica.vs_setup.uniforms.f[ui];
+                    std::fprintf(f, " f%d=(%.4f,%.4f,%.4f,%.4f)", ui, (double)u.x.ToFloat32(),
+                                 (double)u.y.ToFloat32(), (double)u.z.ToFloat32(),
+                                 (double)u.w.ToFloat32());
+                }
+                std::fprintf(f, "\n");
+            }
+            // Attribute-loader data offsets (relative to vbuf base) — lets us
+            // resolve the ACTUAL per-draw vertex-source VA for a watchpoint,
+            // since vbuf= alone is the shared base_address register, not the
+            // per-draw buffer address.
+            {
+                const auto& va = regs.pipeline.vertex_attributes;
+                std::fprintf(
+                    f, "  ldr_off=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u attr_mask=%03x max_attr=%u\n",
+                    (unsigned)va.attribute_loaders[0].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[1].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[2].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[3].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[4].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[5].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[6].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[7].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[8].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[9].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[10].data_offset.Value(),
+                    (unsigned)va.attribute_loaders[11].data_offset.Value(),
+                    (unsigned)va.attribute_mask.Value(), (unsigned)va.max_attribute_index.Value());
+            }
+            // Also emit the 6 TEV stage summaries: source1/source2 + operation + constant color.
+            const auto tev_stages = regs.texturing.GetTevStages();
+            for (size_t si = 0; si < tev_stages.size() && si < 6; ++si) {
+                const auto& ts = tev_stages[si];
+                std::fprintf(f,
+                             "  tev[%zu] cs=(%d,%d,%d) cmod=(%d,%d,%d) cop=%d "
+                             "as=(%d,%d,%d) amod=(%d,%d,%d) aop=%d "
+                             "cconst=(%d,%d,%d,%d) cscale=%u ascale=%u\n",
+                             si, (int)ts.color_source1.Value(), (int)ts.color_source2.Value(),
+                             (int)ts.color_source3.Value(), (int)ts.color_modifier1.Value(),
+                             (int)ts.color_modifier2.Value(), (int)ts.color_modifier3.Value(),
+                             (int)ts.color_op.Value(), (int)ts.alpha_source1.Value(),
+                             (int)ts.alpha_source2.Value(), (int)ts.alpha_source3.Value(),
+                             (int)ts.alpha_modifier1.Value(), (int)ts.alpha_modifier2.Value(),
+                             (int)ts.alpha_modifier3.Value(), (int)ts.alpha_op.Value(),
+                             (int)ts.const_r.Value(), (int)ts.const_g.Value(),
+                             (int)ts.const_b.Value(), (int)ts.const_a.Value(),
+                             ts.GetColorMultiplier(), ts.GetAlphaMultiplier());
+            }
+            std::fclose(f);
+        }
+    }
 
     if (regs.rasterizer.cull_mode == RasterizerRegs::CullMode::KeepAll ||
         regs.rasterizer.cull_mode == RasterizerRegs::CullMode::KeepAll2) {
@@ -441,6 +555,119 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
                 auto combiner_output =
                     WriteTevConfig(texture_color, tev_stages, primary_color, primary_fragment_color,
                                    secondary_fragment_color);
+
+                // TASK16 moon pixel debug — dump texture_color / primary_color /
+                // combiner_output for the moon texture addresses so we can see
+                // what the combiner ACTUALLY outputs per-pixel (the per-triangle
+                // draw-log only captures pre-interpolation vertex color, not the
+                // resolved per-pixel combiner result).
+                if (soh3d_draw_log_active && soh3d_draw_log_path[0]) {
+                    const auto texs_dbg = regs.texturing.GetTextures();
+                    const u32 t0dbg =
+                        texs_dbg[0].enabled ? texs_dbg[0].config.GetPhysicalAddress() : 0u;
+                    // Generic per-pixel dump target: SOH3D_PIXEL_TEX=<hex phys addr> selects any
+                    // texture's draws for PIXEL-line dumping (in addition to the moon/fire set).
+                    static const u32 env_tex = []() -> u32 {
+                        const char* s = std::getenv("SOH3D_PIXEL_TEX");
+                        return s ? (u32)std::strtoul(s, nullptr, 16) : 0u;
+                    }();
+                    // SOH3D_PIXEL_UNTEX=1: also dump UNTEXTURED draws (tex0
+                    // disabled) — used for the title horizon-haze ring RE
+                    // (dawn-hue axis, 2026-07-10), whose draws have no tex0.
+                    static const bool env_untex = []() {
+                        const char* s = std::getenv("SOH3D_PIXEL_UNTEX");
+                        return s && *s && *s != '0';
+                    }();
+                    // SOH3D_PIXEL_DRAW=<n>: dump every fragment generated by one exact draw.
+                    // The draw identity matches vsuni_log's pre-increment `draw n=` field.
+                    static const int env_draw = []() {
+                        const char* s = std::getenv("SOH3D_PIXEL_DRAW");
+                        return s && *s ? (int)std::strtol(s, nullptr, 0) : -1;
+                    }();
+                    // SOH3D_PIXEL_XY=<x>,<y>: dump EVERY draw's fragment that
+                    // lands on this one framebuffer pixel (any texture, any
+                    // blend) — the full compositing stack at one coordinate.
+                    // Decisive for "which layer paints this region" questions
+                    // (dawn-hue axis RE, 2026-07-10).
+                    static const auto env_xy = []() -> std::pair<int, int> {
+                        const char* s = std::getenv("SOH3D_PIXEL_XY");
+                        if (!s || !*s)
+                            return {-1, -1};
+                        int px = -1, py = -1;
+                        std::sscanf(s, "%d,%d", &px, &py);
+                        return {px, py};
+                    }();
+                    if (env_xy.first >= 0 && (int)(x >> 4) == env_xy.first &&
+                        (int)(y >> 4) == env_xy.second) {
+                        if (FILE* fxy = std::fopen(soh3d_draw_log_path, "a")) {
+                            const auto out_dbg = regs.framebuffer.output_merger;
+                            std::fprintf(
+                                fxy,
+                                "PIXELXY draw=%d cbuf=%08x tex0=%08x xy=(%u,%u) "
+                                "texcol=(%d,%d,%d,%d) tex1col=(%d,%d,%d,%d) "
+                                "primary=(%d,%d,%d,%d) combined=(%d,%d,%d,%d) uv1=(%.6f,%.6f) "
+                                "blend=%d,%d "
+                                "depth=%.4f\n",
+                                oracle_draw_index,
+                                (unsigned)
+                                    regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress(),
+                                t0dbg, (unsigned)(x >> 4), (unsigned)(y >> 4),
+                                (int)texture_color[0].r(), (int)texture_color[0].g(),
+                                (int)texture_color[0].b(), (int)texture_color[0].a(),
+                                (int)texture_color[1].r(), (int)texture_color[1].g(),
+                                (int)texture_color[1].b(), (int)texture_color[1].a(),
+                                (int)primary_color.r(), (int)primary_color.g(),
+                                (int)primary_color.b(), (int)primary_color.a(),
+                                (int)combiner_output.r(), (int)combiner_output.g(),
+                                (int)combiner_output.b(), (int)combiner_output.a(),
+                                uv[1].u().ToFloat32(), uv[1].v().ToFloat32(),
+                                (int)out_dbg.alpha_blending.factor_source_rgb.Value(),
+                                (int)out_dbg.alpha_blending.factor_dest_rgb.Value(), depth);
+                            std::fclose(fxy);
+                        }
+                    }
+                    const bool env_draw_match = env_draw >= 0 && oracle_draw_index == env_draw;
+                    if (t0dbg == 0x20906a80u || t0dbg == 0x2090ec80u || t0dbg == 0x20910e80u ||
+                        (env_tex && t0dbg == env_tex) || env_draw_match ||
+                        (env_untex && !texs_dbg[0].enabled &&
+                         ((int)combiner_output.r() | (int)combiner_output.g() |
+                          (int)combiner_output.b()) != 0)) {
+                        static int fire_count_disc = 0, fire_count_ha = 0, fire_count_hb = 0,
+                                   env_count = 0;
+                        int* fc = ((env_tex && t0dbg == env_tex) || env_draw_match) ? &env_count
+                                  : (t0dbg == 0x20906a80u) ? &fire_count_disc
+                                  : (t0dbg == 0x2090ec80u) ? &fire_count_ha
+                                                           : &fire_count_hb;
+                        // Cap: 200 for the hardcoded moon/fire set, but the generic
+                        // SOH3D_PIXEL_TEX target needs the WHOLE draw to compute a mean
+                        // texcol/PRIMARY over a surface (Kokiri near-terrain overbright RE,
+                        // 2026-07-22) — 200 samples land on two scanlines and are not
+                        // representative. Diagnostic path only.
+                        const int fc_cap =
+                            ((env_tex && t0dbg == env_tex) || env_draw_match) ? 4000000 : 200;
+                        if (*fc < fc_cap) {
+                            (*fc)++;
+                            FILE* fdbg = std::fopen(soh3d_draw_log_path, "a");
+                            if (fdbg) {
+                                std::fprintf(fdbg,
+                                             "PIXEL draw=%d tex0=%08x xy=(%u,%u) depth=%.6f "
+                                             "texcol=(%d,%d,%d,%d) tex1col=(%d,%d,%d,%d) "
+                                             "primary=(%d,%d,%d,%d) combined=(%d,%d,%d,%d)\n",
+                                             oracle_draw_index, t0dbg, (unsigned)(x >> 4),
+                                             (unsigned)(y >> 4), depth, (int)texture_color[0].r(),
+                                             (int)texture_color[0].g(), (int)texture_color[0].b(),
+                                             (int)texture_color[0].a(), (int)texture_color[1].r(),
+                                             (int)texture_color[1].g(), (int)texture_color[1].b(),
+                                             (int)texture_color[1].a(), (int)primary_color.r(),
+                                             (int)primary_color.g(), (int)primary_color.b(),
+                                             (int)primary_color.a(), (int)combiner_output.r(),
+                                             (int)combiner_output.g(), (int)combiner_output.b(),
+                                             (int)combiner_output.a());
+                                std::fclose(fdbg);
+                            }
+                        }
+                    }
+                }
 
                 const auto& output_merger = regs.framebuffer.output_merger;
                 if (output_merger.fragment_operation_mode ==

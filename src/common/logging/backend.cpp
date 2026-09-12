@@ -283,6 +283,14 @@ public:
         Filter filter;
         filter.ParseFilterString(Settings::values.log_filter.GetValue());
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(new Impl(callback, filter), Deleter);
+        // SOH3D harness patch (AZAHAR_PATCH.md): the file-based Initialize sets
+        // logging_initialized=true, but this libretro overload forgot to. That
+        // left FmtLogMessageImpl taking the pre-init branch for EVERY message
+        // (see backend.cpp: `if (logging_initialized)`), which writes straight
+        // to stderr UNFILTERED — so SetGlobalFilter() was a no-op and per-frame
+        // Debug spam (Audio.DSP mixers, Render.Vulkan) flooded the harness and
+        // throttled the frame loop. Set it here so the global filter is honored.
+        logging_initialized = true;
         initialization_in_progress_suppress_logging = false;
     }
 #endif

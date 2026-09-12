@@ -69,6 +69,19 @@ public:
         return use_new_hash;
     }
 
+    /// soh3d_harness parity instrumentation (tools/soh3d_harness/AZAHAR_PATCH.md
+    /// Patch 8). Read-only: lets the harness PROVE the hi-res pack is actually
+    /// in effect on the oracle side instead of assuming it.
+    struct Stats {
+        std::size_t files;     ///< custom texture files parsed out of the pack
+        std::size_t materials; ///< distinct 3DS texture hashes covered
+        u64 hits;              ///< lookups that found a replacement
+        u64 misses;            ///< lookups with no replacement in the pack
+    };
+    Stats GetStats() const noexcept {
+        return Stats{custom_textures.size(), material_map.size(), lookup_hits, lookup_misses};
+    }
+
 private:
     /// Parses the custom texture filename (hash, material type, etc).
     bool ParseFilename(const FileUtil::FSTEntry& file, CustomTexture* texture);
@@ -93,6 +106,9 @@ private:
     bool skip_mipmap{false};
     bool flip_png_files{true};
     bool use_new_hash{true};
+    // soh3d_harness parity instrumentation (AZAHAR_PATCH.md Patch 8).
+    mutable u64 lookup_hits{0};
+    mutable u64 lookup_misses{0};
 };
 
 } // namespace VideoCore

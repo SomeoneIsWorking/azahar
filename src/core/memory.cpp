@@ -29,6 +29,229 @@
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
+// soh3d_harness write-hook forward decl. Defined in tools/soh3d_harness/
+// watchhook.cpp when the harness executable is linked. Weak linkage
+// keeps this a no-op in a plain Azahar build.
+extern "C" void Soh3d_OnMemoryWrite(u32 vaddr, u32 size, u64 data)
+    __attribute__((weak));
+
+// Inline, per-VA write logger for RE. Placed in every case of
+// MemorySystem::Write<T> below so we catch writes to specific target
+// vaddrs regardless of page type (Memory, MemoryWatchpoint,
+// RasterizerCachedMemory, RasterizerCachedMemoryWatchpoint). Bypasses
+// the page-granular MemoryWatchpoint mechanism — that mechanism nulls
+// the fast-path pointer for the whole page, adding overhead to every
+// write in the page, AND misses writes on RasterizerCachedMemory
+// pages (the fast path for GPU-backed memory) unless the page has
+// been explicitly RegisterWatchpoint'd. The inline logger below is
+// always active on the exact byte we care about and prints one line
+// per write.
+//
+// Env: SOH3D_MEMLOG_VAS = comma-separated hex list of vaddrs to log
+//                        (e.g. "0x08721a1a" = envCtx.unk_BF).
+//      SOH3D_MEMLOG_PATH = output file path (default stderr).
+static constexpr int SOH3D_MEMLOG_MAX_VAS = 16;
+static constexpr int SOH3D_MEMLOG_MAX_RANGES = 8;
+struct Soh3dMemLogRange { u32 start; u32 end; };  // half-open [start, end)
+struct Soh3dMemLogCfg {
+    u32 vas[SOH3D_MEMLOG_MAX_VAS];
+    int n_vas = 0;
+    Soh3dMemLogRange ranges[SOH3D_MEMLOG_MAX_RANGES];
+    int n_ranges = 0;
+    std::FILE* fp = nullptr;
+    Soh3dMemLogCfg() {
+        const char* path = std::getenv("SOH3D_MEMLOG_PATH");
+        const char* s_vas = std::getenv("SOH3D_MEMLOG_VAS");
+        const char* s_ranges = std::getenv("SOH3D_MEMLOG_RANGES");
+        if ((!s_vas || !s_vas[0]) && (!s_ranges || !s_ranges[0])) return;
+        fp = (path && path[0]) ? std::fopen(path, "w") : stderr;
+        // Parse discrete VAs.
+        for (const char* s = s_vas ? s_vas : ""; *s && n_vas < SOH3D_MEMLOG_MAX_VAS;) {
+            while (*s == ',' || *s == ' ') ++s;
+            if (!*s) break;
+            char* end = nullptr;
+            u32 v = (u32)std::strtoul(s, &end, 0);
+            if (end == s) break;
+            vas[n_vas++] = v;
+            s = end;
+        }
+        // Parse ranges "start1:end1,start2:end2,..." (both hex).
+        for (const char* s = s_ranges ? s_ranges : ""; *s && n_ranges < SOH3D_MEMLOG_MAX_RANGES;) {
+            while (*s == ',' || *s == ' ') ++s;
+            if (!*s) break;
+            char* end = nullptr;
+            u32 start = (u32)std::strtoul(s, &end, 0);
+            if (end == s || *end != ':') break;
+            s = end + 1;
+            u32 stop = (u32)std::strtoul(s, &end, 0);
+            if (end == s) break;
+            ranges[n_ranges++] = {start, stop};
+            s = end;
+        }
+        if (fp) {
+            std::fprintf(fp, "# soh3d memlog: %d vaddrs, %d ranges\n", n_vas, n_ranges);
+            for (int i = 0; i < n_vas; ++i)
+                std::fprintf(fp, "#   va 0x%08x\n", vas[i]);
+            for (int i = 0; i < n_ranges; ++i)
+                std::fprintf(fp, "#   range [0x%08x, 0x%08x)\n",
+                             ranges[i].start, ranges[i].end);
+            std::fflush(fp);
+        }
+    }
+};
+static Soh3dMemLogCfg g_soh3d_memlog;   // constructed at process start
+// Kept as separate name for a cheap post-store guard on the fast path.
+static int& g_soh3d_memlog_n_vas = g_soh3d_memlog.n_vas;
+
+// Opt-in pointer-acquisition trace for guest memory paths that bypass
+// MemorySystem::Write through a direct host pointer. It is deliberately a
+// single half-open range so normal emulation pays only one disabled branch.
+struct Soh3dPointerLogCfg {
+    u32 start = 0;
+    u32 end = 0;
+    std::FILE* fp = nullptr;
+    Soh3dPointerLogCfg() {
+        const char* range = std::getenv("SOH3D_PTRLOG_RANGE");
+        const char* path = std::getenv("SOH3D_PTRLOG_PATH");
+        if (!range || !range[0]) return;
+        char* split = nullptr;
+        start = (u32)std::strtoul(range, &split, 0);
+        if (split == range || *split != ':') return;
+        end = (u32)std::strtoul(split + 1, &split, 0);
+        if (end <= start || *split != '\0') return;
+        fp = (path && path[0]) ? std::fopen(path, "w") : stderr;
+        if (fp) {
+            std::fprintf(fp, "# soh3d pointer log: [0x%08x, 0x%08x)\n", start, end);
+            std::fflush(fp);
+        }
+    }
+};
+static Soh3dPointerLogCfg g_soh3d_pointer_log;
+
+static inline void Soh3dPointerLog(VAddr vaddr) {
+    if (!g_soh3d_pointer_log.fp || vaddr < g_soh3d_pointer_log.start ||
+        vaddr >= g_soh3d_pointer_log.end) {
+        return;
+    }
+    auto& cpu = Core::System::GetInstance().GetRunningCore();
+    std::fprintf(g_soh3d_pointer_log.fp,
+                 "PTR pc=0x%08x lr=0x%08x va=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x\n",
+                 cpu.GetPC(), cpu.GetReg(14), vaddr, cpu.GetReg(0), cpu.GetReg(1), cpu.GetReg(2),
+                 cpu.GetReg(3), cpu.GetReg(13));
+    std::fflush(g_soh3d_pointer_log.fp);
+}
+
+static inline void Soh3dMemLogBulk(VAddr vaddr, std::size_t size) {
+    if (!g_soh3d_memlog.fp || size == 0) return;
+    const u64 write_end = static_cast<u64>(vaddr) + size;
+    bool hit = false;
+    for (int i = 0; i < g_soh3d_memlog.n_vas && !hit; ++i) {
+        const u32 target = g_soh3d_memlog.vas[i];
+        hit = target >= vaddr && target < write_end;
+    }
+    for (int i = 0; i < g_soh3d_memlog.n_ranges && !hit; ++i) {
+        const auto& range = g_soh3d_memlog.ranges[i];
+        hit = vaddr < range.end && write_end > range.start;
+    }
+    if (!hit) return;
+    auto& cpu = Core::System::GetInstance().GetRunningCore();
+    std::fprintf(g_soh3d_memlog.fp,
+                 "MB pc=0x%08x lr=0x%08x va=0x%08x sz=%zu r0=0x%08x r1=0x%08x r2=0x%08x "
+                 "r3=0x%08x sp=0x%08x\n",
+                 cpu.GetPC(), cpu.GetReg(14), vaddr, size, cpu.GetReg(0), cpu.GetReg(1),
+                 cpu.GetReg(2), cpu.GetReg(3), cpu.GetReg(13));
+    std::fflush(g_soh3d_memlog.fp);
+}
+
+template <typename T>
+static inline void Soh3dMemLog(u32 vaddr, T data) {
+    if (!g_soh3d_memlog.fp) return;
+    // Byte-granular match: any target VA in [vaddr, vaddr + sizeof(T))
+    const u32 write_end = vaddr + (u32)sizeof(T);
+    bool hit = false;
+    for (int i = 0; i < g_soh3d_memlog.n_vas && !hit; ++i) {
+        const u32 t = g_soh3d_memlog.vas[i];
+        if (t >= vaddr && t < write_end) hit = true;
+    }
+    for (int i = 0; i < g_soh3d_memlog.n_ranges && !hit; ++i) {
+        const auto& r = g_soh3d_memlog.ranges[i];
+        if (vaddr < r.end && write_end > r.start) hit = true;
+    }
+    if (!hit) return;
+    auto& cpu = Core::System::GetInstance().GetRunningCore();
+    const u32 pc = cpu.GetPC();
+    const u32 lr = cpu.GetReg(14);
+    const u32 r0 = cpu.GetReg(0);
+    const u32 r1 = cpu.GetReg(1);
+    const u32 r2 = cpu.GetReg(2);
+    const u32 r3 = cpu.GetReg(3);
+    const u32 r4 = cpu.GetReg(4);
+    const u32 r7 = cpu.GetReg(7);
+    const u32 r8 = cpu.GetReg(8);
+    const u32 r9 = cpu.GetReg(9);
+    const u32 r10 = cpu.GetReg(10);
+    // FUN_0040cdd8 receives its renderer-state input at r10 - 0x100 at
+    // the exact store of its configuration template word. Capture the
+    // decomp-grounded fields synchronously with that store; a post-frame
+    // read observes a transient object after it has been recycled.
+    const u32 r10b = r10 - 0x100;
+    const u32 sp = cpu.GetReg(13);
+    auto& memory = Core::System::GetInstance().Memory();
+    const auto read_word = [&memory](u32 address) {
+        return memory.Read32OrNullopt(address).value_or(0);
+    };
+    const u32 r4p8 = read_word(r4 + 0x08);
+    const u32 r4p10 = read_word(r4 + 0x10);
+    const u32 r4p14 = read_word(r4 + 0x14);
+    const u32 saved_r4 = read_word(sp + 0x04);
+    const u32 saved_r4p0 = read_word(saved_r4);
+    const u32 saved_r4p4 = read_word(saved_r4 + 0x04);
+    const u32 saved_r4p5c = read_word(saved_r4 + 0x5c);
+    const u32 saved_r4p6c = read_word(saved_r4 + 0x6c);
+    const u32 saved_r4t14 = read_word(saved_r4p0 + 0x14);
+    const u32 saved_r4t20 = read_word(saved_r4p0 + 0x20);
+    const u32 saved_r4t24 = read_word(saved_r4p0 + 0x24);
+    const u32 r1p10 = read_word(r1 + 0x10);
+    const u32 r1p14 = read_word(r1 + 0x14);
+    const u32 r1p18 = read_word(r1 + 0x18);
+    const u32 r1p1c = read_word(r1 + 0x1c);
+    const u32 r1p20 = read_word(r1 + 0x20);
+    const u32 r1p24 = read_word(r1 + 0x24);
+    const u32 r1p28 = read_word(r1 + 0x28);
+    const u32 r10bp0 = read_word(r10b);
+    const u32 r10bp164 = read_word(r10b + 0x164);
+    const u32 r10bp168 = read_word(r10b + 0x168);
+    const u32 r10bp16c = read_word(r10b + 0x16c);
+    const u32 r10bp170 = read_word(r10b + 0x170);
+    const u32 r10bp174 = read_word(r10b + 0x174);
+    const u32 r10bp178 = read_word(r10b + 0x178);
+    const u32 r10bp17c = read_word(r10b + 0x17c);
+    const u32 r10bp180 = read_word(r10b + 0x180);
+    const u32 r10bp184 = read_word(r10b + 0x184);
+    const u32 r10bp188 = read_word(r10b + 0x188);
+    const u32 r10bp18c = read_word(r10b + 0x18c);
+    const u32 r10bp190 = read_word(r10b + 0x190);
+    u64 wd = 0;
+    std::memcpy(&wd, &data, std::min(sizeof(T), sizeof(u64)));
+    std::fprintf(g_soh3d_memlog.fp,
+                 "MW pc=0x%08x lr=0x%08x va=0x%08x sz=%zu data=0x%016llx "
+                 "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x "
+                 "r7=0x%08x r8=0x%08x r9=0x%08x r10=0x%08x "
+                 "r10b=0x%08x r10bp0=0x%08x r10bp164=0x%08x r10bp168=0x%08x r10bp16c=0x%08x "
+                 "r10bp170=0x%08x r10bp174=0x%08x r10bp178=0x%08x r10bp17c=0x%08x "
+                 "r10bp180=0x%08x r10bp184=0x%08x r10bp188=0x%08x r10bp18c=0x%08x r10bp190=0x%08x "
+                 "r4p8=0x%08x r4p10=0x%08x r4p14=0x%08x sr4=0x%08x sr4p0=0x%08x sr4p4=0x%08x "
+                 "sr4p5c=0x%08x sr4p6c=0x%08x sr4t14=0x%08x sr4t20=0x%08x sr4t24=0x%08x "
+                 "r1p10=0x%08x r1p14=0x%08x r1p18=0x%08x r1p1c=0x%08x r1p20=0x%08x "
+                 "r1p24=0x%08x r1p28=0x%08x sp=0x%08x\n",
+                 pc, lr, vaddr, sizeof(T), (unsigned long long)wd, r0, r1, r2, r3, r4, r7, r8, r9,
+                 r10, r10b, r10bp0, r10bp164, r10bp168, r10bp16c, r10bp170, r10bp174, r10bp178,
+                 r10bp17c, r10bp180, r10bp184, r10bp188, r10bp18c, r10bp190, r4p8, r4p10, r4p14,
+                 saved_r4, saved_r4p0, saved_r4p4, saved_r4p5c, saved_r4p6c, saved_r4t14,
+                 saved_r4t20, saved_r4t24, r1p10, r1p14, r1p18, r1p1c, r1p20, r1p24, r1p28, sp);
+    std::fflush(g_soh3d_memlog.fp);
+}
+
 SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::FCRAM>)
 SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::VRAM>)
 SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::DSP>)
@@ -183,7 +406,6 @@ public:
             const std::size_t copy_amount = std::min(CITRA_PAGE_SIZE - page_offset, remaining_size);
             const VAddr current_vaddr =
                 static_cast<VAddr>((page_index << CITRA_PAGE_BITS) + page_offset);
-
             switch (page_table.attributes[page_index]) {
             case PageType::Unmapped: {
                 LOG_ERROR(
@@ -242,6 +464,7 @@ public:
             const std::size_t copy_amount = std::min(CITRA_PAGE_SIZE - page_offset, remaining_size);
             const VAddr current_vaddr =
                 static_cast<VAddr>((page_index << CITRA_PAGE_BITS) + page_offset);
+            Soh3dMemLogBulk(current_vaddr, copy_amount);
 
             switch (page_table.attributes[page_index]) {
             case PageType::Unmapped: {
@@ -689,6 +912,12 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
     if (page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(&page_pointer[vaddr & CITRA_PAGE_MASK], &data, sizeof(T));
+        // Soh3d RE hook: cheap post-store log for narrow target VA set.
+        // Init() is a no-op after first call. When SOH3D_MEMLOG_VAS is
+        // unset g_soh3d_memlog_n_vas is 0 and Soh3dMemLog returns
+        // immediately. Kept AFTER the memcpy so the store itself is
+        // unaffected by any harness overhead.
+        if (g_soh3d_memlog.fp) Soh3dMemLog(vaddr, data);
         return;
     }
 
@@ -729,6 +958,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
                    "Missing memory for watchpoint page");
 
         std::memcpy(it->second.memory.GetPtr() + (vaddr & CITRA_PAGE_MASK), &data, sizeof(T));
+        if (g_soh3d_memlog.fp) Soh3dMemLog(vaddr, data);
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
@@ -736,16 +966,29 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
         }
 #endif
 
+        // soh3d_harness write-hook: notify external hook on every write
+        // that lands in a MemoryWatchpoint page. See tools/soh3d_harness/
+        // watchhook.{h,cpp} for the harness-side receiver. Declared at
+        // top-of-file with weak linkage so a build without the harness
+        // stays a no-op.
+        if (&::Soh3d_OnMemoryWrite) {
+            u64 wd = 0;
+            std::memcpy(&wd, &data, std::min(sizeof(T), sizeof(u64)));
+            ::Soh3d_OnMemoryWrite(vaddr, sizeof(T), wd);
+        }
+
         break;
     }
     [[likely]] case PageType::RasterizerCachedMemory: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
         std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
+        if (g_soh3d_memlog.fp) Soh3dMemLog(vaddr, data);
         break;
     }
     case PageType::RasterizerCachedMemoryWatchpoint: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
         std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
+        if (g_soh3d_memlog.fp) Soh3dMemLog(vaddr, data);
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
@@ -841,6 +1084,7 @@ bool MemorySystem::IsValidPhysicalAddress(const PAddr paddr) {
 }
 
 u8* MemorySystem::GetPointer(const VAddr vaddr) {
+    Soh3dPointerLog(vaddr);
     u8* page_pointer = impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS];
     if (page_pointer) {
         return page_pointer + (vaddr & CITRA_PAGE_MASK);
@@ -858,6 +1102,7 @@ u8* MemorySystem::GetPointer(const VAddr vaddr) {
 }
 
 const u8* MemorySystem::GetPointer(const VAddr vaddr) const {
+    Soh3dPointerLog(vaddr);
     const u8* page_pointer = impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS];
     if (page_pointer) {
         return page_pointer + (vaddr & CITRA_PAGE_MASK);

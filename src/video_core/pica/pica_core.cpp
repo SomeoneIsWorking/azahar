@@ -15,6 +15,43 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader/shader.h"
 
+// soh3d_harness VS-uniform draw log (AZAHAR_PATCH.md Patch 5): when active,
+// every trigger_draw appends the current vertex-shader uniform state relevant
+// to CmbVShader lighting (b5/b9/b10, c8/c9 material colors, c80..c88 light
+// dir/diffuse/ambient) to the file. Toggled by the harness REPL `vsuni_log`.
+extern "C" char soh3d_vsuni_log_path[256] = "";
+extern "C" int soh3d_vsuni_log_active = 0;
+
+// soh3d_harness one-shot fixed-function fragment-lighting capture (Patch 10). The REPL
+// selects one draw after a lightweight vsuni discovery pass; that draw's raw
+// PICA config, light records, and activated LUTs are written as structured JSON.
+extern "C" char soh3d_lighting_capture_path[256] = "";
+extern "C" int soh3d_lighting_capture_draw = -1;
+// One-shot positive control for the PICA-lighting draw logger. It changes the
+// live register only while the selected diagnostic draw executes, then restores
+// it before the next draw. This validates the logger's enabled branch without
+// treating the synthetic output as retail behavior.
+extern "C" int soh3d_lighting_log_selftest_draw = -1;
+
+// soh3d_harness per-draw ISOLATION (AZAHAR_PATCH.md Patch 7): a per-frame draw
+// counter plus a "skip this one draw" latch. The harness resets
+// soh3d_draw_index to 0 before each retro_run(); pica increments it on every
+// trigger_draw. With soh3d_draw_skip >= 0 the matching draw's DrawArrays is
+// suppressed, so a frame diff against the unmodified frame yields EXACTLY the
+// screen pixels that draw contributes. That is the oracle-side draw->material
+// mapping the lighting RE needs (which draw paints the near ground?), and it
+// cannot be obtained from the uniform log alone.
+extern "C" int soh3d_draw_index = 0;
+extern "C" int soh3d_draw_skip = -1;
+
+// soh3d_harness fog-state dump (AZAHAR_PATCH.md Patch 6): expose the live
+// PICA fog registers + 128-entry fog LUT so the harness `az_fog` command can
+// read the oracle's ACTUAL per-frame fog curve/color (dawn-hue RE 2026-07-10).
+static void* soh3d_picacore = nullptr;
+
+#include <cstdio>
+#include <cstring>
+
 namespace Pica {
 
 MICROPROFILE_DEFINE(GPU_Drawing, "GPU", "Drawing", MP_RGB(50, 50, 240));
@@ -67,10 +104,101 @@ union CommandHeader {
 };
 static_assert(sizeof(CommandHeader) == sizeof(u32), "CommandHeader has incorrect size!");
 
+template <typename T>
+static u32 Soh3dRawWord(const T& value) {
+    static_assert(sizeof(T) == sizeof(u32));
+    u32 raw = 0;
+    std::memcpy(&raw, &value, sizeof(raw));
+    return raw;
+}
+
+static void Soh3dCaptureFragmentLighting(std::FILE* file, int draw_index, const LightingRegs& regs,
+                                         const PicaCore::Lighting& state) {
+    bool selected_luts[LightingRegs::NumLightingSampler]{};
+    const auto config = regs.config0.config.Value();
+    const auto select_component = [&](LightingRegs::LightingSampler sampler, bool enabled) {
+        const auto index = static_cast<u32>(sampler);
+        if (enabled && LightingRegs::IsLightingSamplerSupported(config, sampler)) {
+            selected_luts[index] = true;
+        }
+    };
+    select_component(LightingRegs::LightingSampler::Distribution0,
+                     regs.config1.disable_lut_d0 == 0);
+    select_component(LightingRegs::LightingSampler::Distribution1,
+                     regs.config1.disable_lut_d1 == 0);
+    select_component(LightingRegs::LightingSampler::Fresnel, regs.config1.disable_lut_fr == 0);
+    select_component(LightingRegs::LightingSampler::ReflectRed, regs.config1.disable_lut_rr == 0);
+    select_component(LightingRegs::LightingSampler::ReflectGreen, regs.config1.disable_lut_rg == 0);
+    select_component(LightingRegs::LightingSampler::ReflectBlue, regs.config1.disable_lut_rb == 0);
+
+    const bool spotlight_supported = LightingRegs::IsLightingSamplerSupported(
+        config, LightingRegs::LightingSampler::SpotlightAttenuation);
+    for (u32 slot = 0; slot <= regs.max_light_index && slot < 8; ++slot) {
+        const u32 light = regs.light_enable.GetNum(slot);
+        if (spotlight_supported && !regs.IsSpotAttenDisabled(light)) {
+            selected_luts[static_cast<u32>(LightingRegs::SpotlightAttenuationSampler(light))] =
+                true;
+        }
+        if (!regs.IsDistAttenDisabled(light)) {
+            selected_luts[static_cast<u32>(LightingRegs::DistanceAttenuationSampler(light))] = true;
+        }
+    }
+
+    std::fprintf(file,
+                 "{\n  \"schema\": 1,\n  \"draw\": %d,\n  \"disable\": %u,\n"
+                 "  \"max_light_index\": %u,\n  \"config0\": \"%08x\",\n"
+                 "  \"config1\": \"%08x\",\n  \"global_ambient\": \"%08x\",\n"
+                 "  \"abs_lut_input\": \"%08x\",\n  \"lut_input\": \"%08x\",\n"
+                 "  \"lut_scale\": \"%08x\",\n  \"light_enable\": \"%08x\",\n",
+                 draw_index, static_cast<unsigned>(regs.disable.Value()),
+                 static_cast<unsigned>(regs.max_light_index.Value()), Soh3dRawWord(regs.config0),
+                 regs.config1.raw, Soh3dRawWord(regs.global_ambient),
+                 Soh3dRawWord(regs.abs_lut_input), Soh3dRawWord(regs.lut_input),
+                 Soh3dRawWord(regs.lut_scale), Soh3dRawWord(regs.light_enable));
+
+    std::fprintf(file, "  \"slot_mapping\": [");
+    for (u32 slot = 0; slot < 8; ++slot) {
+        std::fprintf(file, "%s%u", slot == 0 ? "" : ", ", regs.light_enable.GetNum(slot));
+    }
+    std::fprintf(file, "],\n  \"lights\": [\n");
+    for (u32 index = 0; index < 8; ++index) {
+        const auto& light = regs.light[index];
+        std::fprintf(file,
+                     "    {\"index\": %u, \"specular0\": \"%08x\", \"specular1\": \"%08x\", "
+                     "\"diffuse\": \"%08x\", \"ambient\": \"%08x\", \"xy\": \"%08x\", "
+                     "\"z\": \"%08x\", \"spot_xy\": \"%08x\", \"spot_z\": \"%08x\", "
+                     "\"config\": \"%08x\", \"dist_bias\": \"%08x\", "
+                     "\"dist_scale\": \"%08x\"}%s\n",
+                     index, Soh3dRawWord(light.specular_0), Soh3dRawWord(light.specular_1),
+                     Soh3dRawWord(light.diffuse), Soh3dRawWord(light.ambient),
+                     Soh3dRawWord(light.x), Soh3dRawWord(light.z), Soh3dRawWord(light.spot_x),
+                     Soh3dRawWord(light.spot_z), Soh3dRawWord(light.config),
+                     Soh3dRawWord(light.dist_atten_bias), Soh3dRawWord(light.dist_atten_scale),
+                     index == 7 ? "" : ",");
+    }
+
+    std::fprintf(file, "  ],\n  \"luts\": [\n");
+    bool first_lut = true;
+    for (u32 sampler = 0; sampler < LightingRegs::NumLightingSampler; ++sampler) {
+        if (!selected_luts[sampler]) {
+            continue;
+        }
+        std::fprintf(file, "%s    {\"sampler\": %u, \"entries\": [", first_lut ? "" : ",\n",
+                     sampler);
+        first_lut = false;
+        for (u32 index = 0; index < 256; ++index) {
+            std::fprintf(file, "%s\"%08x\"", index == 0 ? "" : ",", state.luts[sampler][index].raw);
+        }
+        std::fprintf(file, "]}");
+    }
+    std::fprintf(file, "\n  ]\n}\n");
+}
+
 PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> debug_context_)
     : memory{memory_}, debug_context{std::move(debug_context_)},
       geometry_pipeline{regs.internal, gs_unit, gs_setup},
       shader_engine{CreateEngine(Settings::values.use_shader_jit.GetValue())} {
+    soh3d_picacore = this; // AZAHAR_PATCH.md Patch 6 (az_fog)
     InitializeRegs();
     dirty_regs.SetAllDirty();
 
@@ -626,7 +754,126 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
     case PICA_REG_INDEX(pipeline.trigger_draw):
     case PICA_REG_INDEX(pipeline.trigger_draw_indexed): {
         const bool is_indexed = (id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
+        const bool lighting_selftest = soh3d_lighting_log_selftest_draw == soh3d_draw_index;
+        const u32 saved_lighting_disable = regs.internal.lighting.disable.Value();
+        if (lighting_selftest) {
+            regs.internal.lighting.disable.Assign(0);
+            soh3d_lighting_log_selftest_draw = -1;
+        }
+        if (soh3d_lighting_capture_draw == soh3d_draw_index && soh3d_lighting_capture_path[0]) {
+            if (std::FILE* file = std::fopen(soh3d_lighting_capture_path, "w")) {
+                Soh3dCaptureFragmentLighting(file, soh3d_draw_index, regs.internal.lighting,
+                                             lighting);
+                std::fclose(file);
+            }
+            soh3d_lighting_capture_draw = -1;
+        }
+        // soh3d_harness VS-uniform draw log (AZAHAR_PATCH.md Patch 5)
+        if (soh3d_vsuni_log_active && soh3d_vsuni_log_path[0]) {
+            if (std::FILE* f = std::fopen(soh3d_vsuni_log_path, "a")) {
+                const auto& u = vs_setup.uniforms;
+                auto v4 = [&](u32 i) {
+                    return std::array<float, 4>{u.f[i].x.ToFloat32(), u.f[i].y.ToFloat32(),
+                                                u.f[i].z.ToFloat32(), u.f[i].w.ToFloat32()};
+                };
+                std::fprintf(f,
+                             "draw n=%d idx=%d hasCol=%d vLit=%d fLit=%d picaLit=%d"
+                             " cmdList=%08x/%u/%u",
+                             soh3d_draw_index, (int)is_indexed, (int)u.b[5], (int)u.b[9],
+                             (int)u.b[10], regs.internal.lighting.disable ? 0 : 1,
+                             (unsigned)cmd_list.addr, (unsigned)cmd_list.current_index,
+                             (unsigned)cmd_list.length);
+                static const char* names[] = {"matDif", "matAmb", "dir0", "dif0", "amb0", "dir1",
+                                              "dif1", "amb1", "dir2", "dif2", "amb2", "vtxScl0",
+                                              // uProjection rows (c0..c3) — needed to recover
+                                              // the live near/far planes for fog-LUT↔view-
+                                              // distance conversion (dawn-hue fog RE).
+                                              "proj0", "proj1", "proj2", "proj3"};
+                static const u32 regs_idx[] = {8,  9,  80, 81, 82, 83, 84, 85,
+                                               86, 87, 88, 90, 0,  1,  2,  3};
+                for (size_t k = 0; k < 16; k++) {
+                    auto a = v4(regs_idx[k]);
+                    std::fprintf(f, " %s=(%.5g,%.5g,%.5g,%.5g)", names[k], a[0], a[1], a[2], a[3]);
+                }
+                auto log_v4 = [&](const char* name, u32 i) {
+                    auto a = v4(i);
+                    std::fprintf(f, " %s=(%.7g,%.7g,%.7g,%.7g)", name, a[0], a[1], a[2], a[3]);
+                };
+                log_v4("texSlotMap", 89);
+                log_v4("modelView0", 4);
+                log_v4("modelView1", 5);
+                log_v4("modelView2", 6);
+                log_v4("modelView3", 7);
+                log_v4("texMtx0_0", 10);
+                log_v4("texMtx0_1", 11);
+                log_v4("texMtx0_2", 12);
+                log_v4("texMtx1_0", 14);
+                log_v4("texMtx1_1", 15);
+                log_v4("texMtx1_2", 16);
+                log_v4("texMappingMethod", 92);
+                // Patch 6 companion: per-draw fog state (mode/flip/color +
+                // 4 LUT samples) — fog regs are per-draw command-list state,
+                // an end-of-frame dump can miss the terrain draws' setting.
+                {
+                    const auto& tex = regs.internal.texturing;
+                    std::fprintf(
+                        f, " fog=%d/%d(%u,%u,%u) lutS=(%.3f,%.3f,%.3f,%.3f)",
+                        (int)tex.fog_mode.Value(), (int)tex.fog_flip.Value(),
+                        (unsigned)tex.fog_color.r.Value(), (unsigned)tex.fog_color.g.Value(),
+                        (unsigned)tex.fog_color.b.Value(), fog.lut[16].ToFloat(),
+                        fog.lut[48].ToFloat(), fog.lut[96].ToFloat(), fog.lut[127].ToFloat());
+                }
+                // Patch 7 companion: draw IDENTITY, so a logged draw can be tied to a
+                // concrete CMB material on our side — texture0 (address/size/format is
+                // effectively a material key) and the TEV stage-0 config incl. the RGB
+                // scale (cmb.h comb_scale_rgb) that our renderer folds into vertex colour.
+                {
+                    const auto& tx = regs.internal.texturing;
+                    const auto& t0 = tx.texture0;
+                    const auto& s0 = tx.tev_stage0;
+                    std::fprintf(f,
+                                 " tex0=%08x/%ux%u/f%u en=%u nv=%u"
+                                 " tev0=src%06x/mod%06x/op%x-%x/sc%ux%u/k%08x",
+                                 (unsigned)t0.GetPhysicalAddress(), (unsigned)t0.width.Value(),
+                                 (unsigned)t0.height.Value(), (unsigned)tx.texture0_format.Value(),
+                                 (unsigned)tx.main_config.texture0_enable.Value(),
+                                 (unsigned)regs.internal.pipeline.num_vertices,
+                                 (unsigned)s0.sources_raw, (unsigned)s0.modifiers_raw,
+                                 (unsigned)s0.color_op.Value(), (unsigned)s0.alpha_op.Value(),
+                                 s0.GetColorMultiplier(), s0.GetAlphaMultiplier(),
+                                 (unsigned)s0.const_color);
+                    // Multi-texture / multi-stage state: our renderer emulates ONE
+                    // TEV stage with ONE texture, so any draw that enables tex1/tex2 or
+                    // a non-passthrough stage 1..5 is a material-emulation gap, not a
+                    // lighting one. Logged so the two can be told apart.
+                    const auto st = tx.GetTevStages();
+                    std::fprintf(f, " texEn=%u/%u/%u tev1..5=",
+                                 (unsigned)tx.main_config.texture0_enable.Value(),
+                                 (unsigned)tx.main_config.texture1_enable.Value(),
+                                 (unsigned)tx.main_config.texture2_enable.Value());
+                    for (int k = 1; k < 6; k++) {
+                        std::fprintf(f, "%s%06x:%x:%u", k == 1 ? "" : ",",
+                                     (unsigned)st[k].sources_raw, (unsigned)st[k].color_op.Value(),
+                                     st[k].GetColorMultiplier());
+                    }
+                }
+                std::fprintf(f, "\n");
+                std::fclose(f);
+            }
+        }
+        // Patch 7: per-draw isolation latch (see the soh3d_draw_skip comment above).
+        if (soh3d_draw_skip >= 0 && soh3d_draw_index == soh3d_draw_skip) {
+            if (lighting_selftest) {
+                regs.internal.lighting.disable.Assign(saved_lighting_disable);
+            }
+            ++soh3d_draw_index;
+            break;
+        }
+        ++soh3d_draw_index;
         DrawArrays(is_indexed);
+        if (lighting_selftest) {
+            regs.internal.lighting.disable.Assign(saved_lighting_disable);
+        }
         break;
     }
 
@@ -1262,3 +1509,33 @@ void PicaCore::CommandList::serialize(Archive& ar, const u32 file_version) {
 SERIALIZE_IMPL(PicaCore::CommandList)
 
 } // namespace Pica
+
+// AZAHAR_PATCH.md Patch 6: dump the live PICA fog state (mode/flip/color +
+// the 128-entry fog LUT as floats) into `out`. Returns bytes written, or -1
+// if the PicaCore isn't constructed yet. Consumed by soh3d_harness `az_fog`.
+extern "C" int soh3d_fog_dump(char* out, int cap) {
+    if (!soh3d_picacore || !out || cap <= 0) {
+        return -1;
+    }
+    auto* pc = static_cast<Pica::PicaCore*>(soh3d_picacore);
+    const auto& tex = pc->regs.internal.texturing;
+    const auto& ras = pc->regs.internal.rasterizer;
+    int n = std::snprintf(out, (size_t)cap,
+                          "mode=%d flip=%d color=(%u,%u,%u) depthScale=%g depthOffset=%g "
+                          "wbuffer=%d\nlut=",
+                          (int)tex.fog_mode.Value(), (int)tex.fog_flip.Value(),
+                          (unsigned)tex.fog_color.r.Value(), (unsigned)tex.fog_color.g.Value(),
+                          (unsigned)tex.fog_color.b.Value(),
+                          Pica::f24::FromRaw(ras.viewport_depth_range).ToFloat32(),
+                          Pica::f24::FromRaw(ras.viewport_depth_near_plane).ToFloat32(),
+                          (int)ras.depthmap_enable.Value());
+    for (int i = 0; i < 128 && n < cap - 32; i++) {
+        n += std::snprintf(out + n, (size_t)(cap - n), "%s%.4f/%.4f", i ? "," : "",
+                           pc->fog.lut[(size_t)i].ToFloat(), pc->fog.lut[(size_t)i].DiffToFloat());
+    }
+    if (n < cap - 2) {
+        out[n++] = '\n';
+        out[n] = 0;
+    }
+    return n;
+}

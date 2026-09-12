@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
@@ -31,6 +32,12 @@ constexpr u32 SIGTRAP = 5;
 
 namespace Core {
 
+extern "C" u32 soh3d_pc_watch_target __attribute__((weak));
+extern "C" void Soh3d_OnGuestPc() __attribute__((weak));
+
+constexpr u32 Soh3dArmBreakpoint = 0xE1200070;
+constexpr u32 Soh3dThumbBreakpoint = 0x0000BE00;
+
 class DynarmicUserCallbacks final : public Dynarmic::A32::UserCallbacks {
 public:
     explicit DynarmicUserCallbacks(ARM_Dynarmic& parent)
@@ -38,6 +45,10 @@ public:
     ~DynarmicUserCallbacks() = default;
 
     std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override {
+        if (&soh3d_pc_watch_target != nullptr && soh3d_pc_watch_target != 0 &&
+            (soh3d_pc_watch_target & ~1U) == vaddr) [[unlikely]] {
+            return (soh3d_pc_watch_target & 1U) ? Soh3dThumbBreakpoint : Soh3dArmBreakpoint;
+        }
         return memory.Read32OrNullopt(vaddr);
     }
 
@@ -98,6 +109,14 @@ public:
         case Dynarmic::A32::Exception::NoExecuteFault:
             break;
         case Dynarmic::A32::Exception::Breakpoint:
+            if (&soh3d_pc_watch_target != nullptr && Soh3d_OnGuestPc != nullptr &&
+                (soh3d_pc_watch_target & ~1U) == pc) [[unlikely]] {
+                const u32 watched_pc = soh3d_pc_watch_target & ~1U;
+                parent.SetPC(pc);
+                Soh3d_OnGuestPc();
+                parent.InvalidateCacheRange(watched_pc, sizeof(u32));
+                return;
+            }
 #ifdef ENABLE_GDBSTUB
             if (GDBStub::IsConnected()) {
                 parent.SetPC(pc);
@@ -360,7 +379,9 @@ void ARM_Dynarmic::ServeBreak([[maybe_unused]] int signal) {
 std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     Dynarmic::A32::UserConfig config;
     config.callbacks = cb.get();
-    if (current_page_table) {
+    // Oracle-only: disable direct host-pointer memory access so a pre-armed
+    // page watch observes guest stores that normally bypass MemorySystem.
+    if (current_page_table && std::getenv("SOH3D_HARNESS_DISABLE_FASTMEM") == nullptr) {
         config.page_table = &current_page_table->GetPointerArray();
     }
     config.coprocessors[15] = std::make_shared<DynarmicCP15>(cp15_state);

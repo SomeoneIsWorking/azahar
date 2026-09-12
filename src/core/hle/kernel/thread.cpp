@@ -79,7 +79,6 @@ void Thread::serialize(Archive& ar, const unsigned int file_version) {
             ar & wakeup_callback;
         }
     }
-    ar & wakeup_callback;
     ar & unschedule_mode;
 }
 SERIALIZE_IMPL(Thread)
