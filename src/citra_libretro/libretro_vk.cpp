@@ -704,7 +704,8 @@ void PresentWindow::Present(Frame* frame) {
     persistent_libretro_image.create_info =
         static_cast<VkImageViewCreateInfo>(output_view_create_info);
 
-    vulkan_intf->set_image(vulkan_intf->handle, &persistent_libretro_image, 0, nullptr,
+    const VkSemaphore render_ready = static_cast<VkSemaphore>(frame->render_ready);
+    vulkan_intf->set_image(vulkan_intf->handle, &persistent_libretro_image, 1, &render_ready,
                            instance.GetGraphicsQueueFamilyIndex());
 
     // Call EmuWindow SwapBuffers to trigger LibRetro video frame submission
@@ -786,15 +787,18 @@ void MasterSemaphoreLibRetro::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore
     // Get a fence from the pool
     const vk::Fence fence = GetFreeFence();
 
-    // Strip semaphores - RetroArch handles frame sync, we track resources internally
+    // Preserve the scheduler's semaphore contract. The libretro frontend may
+    // receive set_image before this submission executes, so it queues its
+    // readback with this signal semaphore as a wait dependency.
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
     const vk::SubmitInfo submit_info = {
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .pWaitDstStageMask = nullptr,
+        .waitSemaphoreCount = wait ? 1u : 0u,
+        .pWaitSemaphores = wait ? &wait : nullptr,
+        .pWaitDstStageMask = wait ? &wait_stage : nullptr,
         .commandBufferCount = 1u,
         .pCommandBuffers = &cmdbuf,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
+        .signalSemaphoreCount = signal ? 1u : 0u,
+        .pSignalSemaphores = signal ? &signal : nullptr,
     };
 
     // Use LibRetro's queue coordination

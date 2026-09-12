@@ -253,6 +253,12 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
 
         DrawScreens(frame, layout, flipped);
         scheduler.Flush(frame->render_ready);
+#ifdef HAVE_LIBRETRO
+        // Present invokes the libretro video callback synchronously. Ensure
+        // the worker has submitted the command buffer that signals render_ready
+        // before the frontend queues its dependent readback.
+        scheduler.WaitWorker();
+#endif
         window.Present(frame);
         if ((secondaryWindowEnabled && isSecondaryWindow) || (!secondaryWindowEnabled)) {
             Core::PerfStats::game_frames_updated = false;
