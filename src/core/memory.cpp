@@ -118,6 +118,7 @@ public:
     std::shared_ptr<BackingMem> dsp_mem;
 
     PAddr plugin_fb_address{};
+    WriteObserver write_observer;
 
     Impl(Core::System& system_);
 
@@ -729,6 +730,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
                    "Missing memory for watchpoint page");
 
         std::memcpy(it->second.memory.GetPtr() + (vaddr & CITRA_PAGE_MASK), &data, sizeof(T));
+        NotifyWrite(vaddr, data);
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
@@ -746,6 +748,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
     case PageType::RasterizerCachedMemoryWatchpoint: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
         std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
+        NotifyWrite(vaddr, data);
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
@@ -758,6 +761,17 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
     default:
         UNREACHABLE();
     }
+}
+
+template <typename T>
+void MemorySystem::NotifyWrite(const VAddr vaddr, const T data) {
+    if (impl->write_observer) {
+        impl->write_observer(vaddr, sizeof(T), static_cast<u64>(data));
+    }
+}
+
+void MemorySystem::SetWriteObserver(WriteObserver observer) {
+    impl->write_observer = std::move(observer);
 }
 
 template <typename T>

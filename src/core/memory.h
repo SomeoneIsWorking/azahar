@@ -5,6 +5,7 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <boost/serialization/array.hpp>
@@ -705,9 +706,16 @@ public:
 
     void UnregisterWatchpoint(const Kernel::Process& process, VAddr addr, u32 size);
 
+    /// Called after a guest write lands on a watchpoint page; the observer filters by address.
+    using WriteObserver = std::function<void(VAddr vaddr, u32 size, u64 value)>;
+    void SetWriteObserver(WriteObserver observer);
+
 private:
     template <typename T>
     void UnmappedAccess(const VAddr vaddr, const T value, bool read);
+
+    template <typename T>
+    void NotifyWrite(VAddr vaddr, T data);
 
     template <typename T>
     T Read(const std::shared_ptr<PageTable>& page_table, const VAddr vaddr);
