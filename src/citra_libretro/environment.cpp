@@ -119,6 +119,10 @@ bool SetMemoryMaps(const retro_memory_map* map) {
     return environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, (void*)map);
 }
 
+bool SetPrivateEnvironment(unsigned command, const void* data) {
+    return environ_cb(command, const_cast<void*>(data));
+}
+
 bool SetControllerInfo(const retro_controller_info info[]) {
     return environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)info);
 }

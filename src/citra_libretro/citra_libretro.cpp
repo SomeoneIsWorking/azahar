@@ -30,6 +30,7 @@
 
 #include "citra_libretro/citra_libretro.h"
 #include "citra_libretro/core_settings.h"
+#include "citra_libretro/debug_interface.h"
 #include "citra_libretro/environment.h"
 #include "citra_libretro/input/input_factory.h"
 
@@ -414,6 +415,7 @@ static bool do_load_game() {
     }
 
     setup_memory_maps();
+    LibRetro::Debug::PublishToFrontend();
 
     return true;
 }
@@ -634,6 +636,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 
 void retro_unload_game() {
     LOG_DEBUG(Frontend, "Unloading game...");
+    LibRetro::Debug::Reset();
     Core::System::GetInstance().Shutdown();
 }
 
