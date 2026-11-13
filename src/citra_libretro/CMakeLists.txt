@@ -13,10 +13,7 @@ add_library(citra_libretro_common OBJECT
         environment.cpp
         environment.h
         core_settings.cpp
-        core_settings.h
-        debug_interface.cpp
-        debug_interface.h
-        azahar_debug.h)
+        core_settings.h)
 
 target_compile_definitions(citra_libretro_common PRIVATE HAVE_LIBRETRO)
 target_link_libraries(citra_libretro_common PRIVATE citra_common citra_core video_core libretro tsl::robin_map)

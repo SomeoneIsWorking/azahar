@@ -69,9 +69,6 @@ bool SetControllerInfo(const retro_controller_info info[]);
 /// Sets the memory maps for the core.
 bool SetMemoryMaps(const retro_memory_map* map);
 
-/// Sends a frontend-private command (azahar_debug.h); false when the frontend does not know it.
-bool SetPrivateEnvironment(unsigned command, const void* data);
-
 /// Sets the framebuffer pixel format.
 bool SetPixelFormat(const retro_pixel_format fmt);
 
