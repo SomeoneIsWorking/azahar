@@ -653,6 +653,8 @@ struct Values {
     // Debugging
     bool record_frame_times;
     std::unordered_map<std::string, bool> lle_modules;
+    // Folders beside a title's mods romfs/ (load/mods/<id>/<name>/) layered over it, in order.
+    std::vector<std::string> romfs_layers;
     Setting<bool> delay_start_for_lle_modules{true, Keys::delay_start_for_lle_modules};
     Setting<bool> use_gdbstub{false, Keys::use_gdbstub};
     Setting<u16> gdbstub_port{24689, Keys::gdbstub_port};

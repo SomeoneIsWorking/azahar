@@ -11,6 +11,7 @@
 #include "common/common_types.h"
 #include "common/file_derived.h"
 #include "common/logging/log.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/file_sys/layered_fs.h"
 #include "core/file_sys/ncch_container.h"
@@ -647,6 +648,13 @@ Loader::ResultStatus NCCHContainer::ReadRomFS(std::shared_ptr<RomFSReader>& romf
                                                  path + "romfs_ext/");
     } else {
         romfs_file = std::move(direct_romfs);
+    }
+    if (!is_proto && use_layered_fs) {
+        for (const std::string& layer : Settings::values.romfs_layers) {
+            if (FileUtil::Exists(path + layer + "/")) {
+                romfs_file = std::make_shared<LayeredFS>(std::move(romfs_file), path + layer + "/", "");
+            }
+        }
     }
 
     return Loader::ResultStatus::Success;
