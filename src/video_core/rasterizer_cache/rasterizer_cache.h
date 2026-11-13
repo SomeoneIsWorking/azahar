@@ -967,23 +967,22 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         return;
     }
 
-    Surface& surface = slot_surfaces[surface_id];
     const SurfaceInterval validate_interval(addr, addr + size);
 
-    if (surface.type == SurfaceType::Fill) {
-        ASSERT_MSG(surface.IsRegionValid(validate_interval),
+    if (slot_surfaces[surface_id].type == SurfaceType::Fill) {
+        ASSERT_MSG(slot_surfaces[surface_id].IsRegionValid(validate_interval),
                    "Attempted to validate a non-valid fill surface");
         return;
     }
 
-    SurfaceRegions validate_regions = surface.invalid_regions & validate_interval;
+    SurfaceRegions validate_regions = slot_surfaces[surface_id].invalid_regions & validate_interval;
 
     if (validate_regions.empty()) {
         return;
     }
 
     auto notify_validated = [&](SurfaceInterval interval) {
-        surface.MarkValid(interval);
+        slot_surfaces[surface_id].MarkValid(interval);
         validate_regions.erase(interval);
     };
 
@@ -991,9 +990,12 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
                            "RasterizerCache::ValidateSurface (from {:#x} to {:#x})", addr,
                            addr + size};
 
-    u32 level = surface.LevelOf(addr);
-    SurfaceInterval level_interval = surface.LevelInterval(level);
+    u32 level = slot_surfaces[surface_id].LevelOf(addr);
+    SurfaceInterval level_interval = slot_surfaces[surface_id].LevelInterval(level);
     while (!validate_regions.empty()) {
+        // A custom upload below replaces the surface and can move the slot storage, so the
+        // surface is looked up again on every pass.
+        Surface& surface = slot_surfaces[surface_id];
         // Take an invalid interval from the validation regions and clamp it
         // to the current level interval. If the interval is empty
         // then we have validated the entire level so move to the next.
@@ -1024,13 +1026,14 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
 
         FlushRegion(params.addr, params.size);
         if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
-            UploadSurface(surface, interval);
+            UploadSurface(slot_surfaces[surface_id], interval);
         }
         notify_validated(params.GetInterval());
     }
 
     // Filtered mipmaps often look really bad. We can achieve better quality by
     // generating them from the base level.
+    Surface& surface = slot_surfaces[surface_id];
     if (surface.res_scale != 1 && level != 0) {
         runtime.GenerateMipmaps(surface);
     }
