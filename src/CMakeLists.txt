@@ -227,3 +227,10 @@ endif()
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
 endif()
+
+# Frontends kept outside this tree, built against the core libraries above.
+set(AZAHAR_EXTRA_FRONTENDS "" CACHE STRING "Directories of out-of-tree frontends")
+foreach(frontend_dir IN LISTS AZAHAR_EXTRA_FRONTENDS)
+    cmake_path(GET frontend_dir FILENAME frontend_name)
+    add_subdirectory("${frontend_dir}" "${CMAKE_BINARY_DIR}/frontends/${frontend_name}")
+endforeach()
