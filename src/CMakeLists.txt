@@ -234,3 +234,8 @@ foreach(frontend_dir IN LISTS AZAHAR_EXTRA_FRONTENDS)
     cmake_path(GET frontend_dir FILENAME frontend_name)
     add_subdirectory("${frontend_dir}" "${CMAKE_BINARY_DIR}/frontends/${frontend_name}")
 endforeach()
+
+option(AZAHAR_CORE_PACKAGE "Install the core as a shared library and CMake package" OFF)
+if (AZAHAR_CORE_PACKAGE)
+    add_subdirectory(core_package)
+endif()
