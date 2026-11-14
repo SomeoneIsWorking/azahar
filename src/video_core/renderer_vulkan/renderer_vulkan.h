@@ -111,6 +111,7 @@ private:
                                 float h, Layout::DisplayOrientation orientation);
 
     void ApplySecondLayerOpacity(float alpha);
+    void DrawScreenPiece(u32 screen_id, const Settings::ScreenPiece& piece);
 
     void DrawCursor(const Layout::FramebufferLayout& layout);
 
@@ -144,6 +145,8 @@ private:
 
     std::array<ScreenInfo, 3> screen_infos{};
     PresentUniformData draw_info{};
+    // The opacity of the screens drawn from now on.
+    float layer_opacity = 1.0f;
     vk::ClearColorValue clear_color{};
 
     vk::ShaderModule cursor_vertex_shader{};

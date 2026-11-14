@@ -43,7 +43,22 @@ struct ScreenRectVertex {
 
     Common::Vec2f position;
     Common::Vec2f tex_coord;
+    // Where the vertex is in its rectangle, and the rectangle's width, height, corner radius and
+    // opacity, for the fragment's coverage.
+    Common::Vec2f local{};
+    Common::Vec4f shape{};
 };
+
+// Vertices in the order top left, top right, bottom left, bottom right.
+void ShapeRect(std::array<ScreenRectVertex, 4>& vertices, float w, float h, float radius,
+               float opacity) {
+    const std::array corners = {Common::MakeVec(0.0f, 0.0f), Common::MakeVec(w, 0.0f),
+                                Common::MakeVec(0.0f, h), Common::MakeVec(w, h)};
+    for (std::size_t i = 0; i < vertices.size(); i++) {
+        vertices[i].local = corners[i];
+        vertices[i].shape = Common::MakeVec(w, h, radius, opacity);
+    }
+}
 
 constexpr u32 VERTEX_BUFFER_SIZE = sizeof(ScreenRectVertex) * 8192;
 
@@ -376,6 +391,18 @@ void RendererVulkan::BuildPipelines() {
             .format = vk::Format::eR32G32Sfloat,
             .offset = offsetof(ScreenRectVertex, tex_coord),
         },
+        vk::VertexInputAttributeDescription{
+            .location = 2,
+            .binding = 0,
+            .format = vk::Format::eR32G32Sfloat,
+            .offset = offsetof(ScreenRectVertex, local),
+        },
+        vk::VertexInputAttributeDescription{
+            .location = 3,
+            .binding = 0,
+            .format = vk::Format::eR32G32B32A32Sfloat,
+            .offset = offsetof(ScreenRectVertex, shape),
+        },
     };
 
     const vk::PipelineVertexInputStateCreateInfo vertex_input_info = {
@@ -406,11 +433,11 @@ void RendererVulkan::BuildPipelines() {
 
     const vk::PipelineColorBlendAttachmentState colorblend_attachment = {
         .blendEnable = true,
-        .srcColorBlendFactor = vk::BlendFactor::eConstantAlpha,
-        .dstColorBlendFactor = vk::BlendFactor::eOneMinusConstantAlpha,
+        .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+        .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
         .colorBlendOp = vk::BlendOp::eAdd,
-        .srcAlphaBlendFactor = vk::BlendFactor::eConstantAlpha,
-        .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusConstantAlpha,
+        .srcAlphaBlendFactor = vk::BlendFactor::eSrcAlpha,
+        .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
         .alphaBlendOp = vk::BlendOp::eAdd,
         .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
@@ -432,7 +459,6 @@ void RendererVulkan::BuildPipelines() {
     };
 
     const std::array dynamic_states = {
-        vk::DynamicState::eBlendConstants,
         vk::DynamicState::eViewport,
         vk::DynamicState::eScissor,
     };
@@ -790,6 +816,8 @@ void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, 
         break;
     }
 
+    ShapeRect(vertices, w, h, 0.0f, layer_opacity);
+
     const u64 size = sizeof(ScreenRectVertex) * vertices.size();
     auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
     std::memcpy(data, vertices.data(), size);
@@ -862,6 +890,8 @@ void RendererVulkan::DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, fl
         break;
     }
 
+    ShapeRect(vertices, w, h, 0.0f, layer_opacity);
+
     const u64 size = sizeof(ScreenRectVertex) * vertices.size();
     auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
     std::memcpy(data, vertices.data(), size);
@@ -889,9 +919,56 @@ void RendererVulkan::DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, fl
 }
 
 void RendererVulkan::ApplySecondLayerOpacity(float alpha) {
-    scheduler.Record([alpha](vk::CommandBuffer cmdbuf) {
-        const std::array<float, 4> blend_constants = {0.0f, 0.0f, 0.0f, alpha};
-        cmdbuf.setBlendConstants(blend_constants.data());
+    layer_opacity = alpha;
+}
+
+void RendererVulkan::DrawScreenPiece(u32 screen_id, const Settings::ScreenPiece& piece) {
+    const ScreenInfo& screen_info = screen_infos[screen_id];
+    const auto& texcoords = screen_info.texcoords;
+    const float screen_width = static_cast<float>(screen_info.texture.height);
+    const float screen_height = static_cast<float>(screen_info.texture.width);
+    // The screen's texture lies on its side: its first coordinate runs down the screen.
+    const auto down = [&](float y) {
+        return texcoords.bottom + (texcoords.top - texcoords.bottom) * y / screen_height;
+    };
+    const auto across = [&](float x) {
+        return texcoords.left + (texcoords.right - texcoords.left) * x / screen_width;
+    };
+    const float u0 = down(piece.source_y);
+    const float u1 = down(piece.source_y + piece.source_height);
+    const float v0 = across(piece.source_x);
+    const float v1 = across(piece.source_x + piece.source_width);
+    std::array<ScreenRectVertex, 4> vertices = {{
+        ScreenRectVertex(piece.x, piece.y, u0, v0),
+        ScreenRectVertex(piece.x + piece.width, piece.y, u0, v1),
+        ScreenRectVertex(piece.x, piece.y + piece.height, u1, v0),
+        ScreenRectVertex(piece.x + piece.width, piece.y + piece.height, u1, v1),
+    }};
+    ShapeRect(vertices, piece.width, piece.height, piece.radius, piece.opacity);
+
+    const u64 size = sizeof(ScreenRectVertex) * vertices.size();
+    auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
+    std::memcpy(data, vertices.data(), size);
+    vertex_buffer.Commit(size);
+
+    const u32 scale_factor = GetResolutionScaleFactor();
+    draw_info.i_resolution =
+        Common::MakeVec(static_cast<f32>(screen_info.texture.width * scale_factor),
+                        static_cast<f32>(screen_info.texture.height * scale_factor),
+                        1.0f / static_cast<f32>(screen_info.texture.width * scale_factor),
+                        1.0f / static_cast<f32>(screen_info.texture.height * scale_factor));
+    draw_info.o_resolution = Common::MakeVec(piece.height, piece.width, 1.0f / piece.height,
+                                             1.0f / piece.width);
+    draw_info.screen_id_l = screen_id;
+
+    scheduler.Record([this, offset = offset, info = draw_info](vk::CommandBuffer cmdbuf) {
+        const u32 first_vertex = static_cast<u32>(offset) / sizeof(ScreenRectVertex);
+        cmdbuf.pushConstants(*present_pipeline_layout,
+                             vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
+                             0, sizeof(info), &info);
+
+        cmdbuf.bindVertexBuffers(0, vertex_buffer.Handle(), {0});
+        cmdbuf.draw(4, 1, first_vertex, 0);
     });
 }
 
@@ -969,6 +1046,12 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
 
     switch (layout.render_3d_mode) {
     case Settings::StereoRenderOption::Off: {
+        if (!layout.bottom_pieces.empty() && &bottom_screen == &layout.bottom_screen) {
+            for (const Settings::ScreenPiece& piece : layout.bottom_pieces) {
+                DrawScreenPiece(2, piece);
+            }
+            break;
+        }
         DrawSingleScreen(2, bottom_screen_left, bottom_screen_top, bottom_screen_width,
                          bottom_screen_height, orientation);
 

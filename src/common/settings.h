@@ -472,6 +472,21 @@ struct TouchFromButtonMap {
 /// value to fit the region lockout info of the game
 static constexpr s32 REGION_VALUE_AUTO_SELECT = -1;
 
+// A part of the bottom screen that the custom layout draws by itself: `source_*` in the screen's
+// own pixels, the destination, the corner radius and the opacity in the layout's.
+struct ScreenPiece {
+    float source_x;
+    float source_y;
+    float source_width;
+    float source_height;
+    float x;
+    float y;
+    float width;
+    float height;
+    float radius;
+    float opacity;
+};
+
 struct Values {
     // Controls
     InputProfile current_input_profile;       ///< The current input profile
@@ -655,6 +670,9 @@ struct Values {
     std::unordered_map<std::string, bool> lle_modules;
     // Folders beside a title's mods romfs/ (load/mods/<id>/<name>/) layered over it, in order.
     std::vector<std::string> romfs_layers;
+    // With any, the custom layout draws these instead of the whole bottom screen; its bottom
+    // rectangle still maps touches.
+    std::vector<ScreenPiece> custom_bottom_pieces;
     Setting<bool> delay_start_for_lle_modules{true, Keys::delay_start_for_lle_modules};
     Setting<bool> use_gdbstub{false, Keys::use_gdbstub};
     Setting<u16> gdbstub_port{24689, Keys::gdbstub_port};

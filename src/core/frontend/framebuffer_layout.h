@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <vector>
 #include "common/math_util.h"
 #include "common/settings.h"
 
@@ -41,6 +42,8 @@ struct FramebufferLayout {
     bool additional_screen_is_bottom = false;
     Common::Rectangle<u32> additional_screen;
     CardboardSettings cardboard;
+    // Settings::values.custom_bottom_pieces, in the custom landscape layout.
+    std::vector<Settings::ScreenPiece> bottom_pieces;
 
     /**
      * Returns the ratio of pixel size of the top screen, compared to the native size of the 3DS

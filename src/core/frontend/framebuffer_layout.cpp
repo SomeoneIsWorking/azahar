@@ -378,6 +378,9 @@ FramebufferLayout CustomFrameLayout(u32 width, u32 height, bool is_swapped, bool
     } else {
         res.top_screen = top_screen;
         res.bottom_screen = bot_screen;
+        if (!is_portrait_mode && !upright) {
+            res.bottom_pieces = Settings::values.custom_bottom_pieces;
+        }
     }
     if (upright) {
         return reverseLayout(res);
