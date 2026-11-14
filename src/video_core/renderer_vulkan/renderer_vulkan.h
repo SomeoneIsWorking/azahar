@@ -112,6 +112,9 @@ private:
 
     void ApplySecondLayerOpacity(float alpha);
     void DrawScreenPiece(u32 screen_id, const Settings::ScreenPiece& piece);
+    void UpdateOverlayTexture();
+    void DestroyOverlayTexture();
+    void DrawOverlayQuad(const Settings::OverlayQuad& quad);
 
     void DrawCursor(const Layout::FramebufferLayout& layout);
 
@@ -144,6 +147,10 @@ private:
     u32 current_pipeline = 0;
 
     std::array<ScreenInfo, 3> screen_infos{};
+    // Settings::values.overlay_image as uploaded: the present shaders' fourth texture.
+    static constexpr u32 OVERLAY_SCREEN_ID = 3;
+    TextureInfo overlay_texture{};
+    u64 overlay_generation = 0;
     PresentUniformData draw_info{};
     // The opacity of the screens drawn from now on.
     float layer_opacity = 1.0f;

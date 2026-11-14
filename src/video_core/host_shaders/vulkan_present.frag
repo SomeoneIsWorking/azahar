@@ -21,7 +21,7 @@ layout (push_constant, std140) uniform DrawInfo {
     int reverse_interlaced;
 };
 
-layout (set = 0, binding = 0) uniform sampler2D screen_textures[3];
+layout (set = 0, binding = 0) uniform sampler2D screen_textures[4];
 
 vec4 GetScreen(int screen_id) {
 #ifdef ARRAY_DYNAMIC_INDEX
@@ -50,5 +50,11 @@ float Coverage() {
 }
 
 void main() {
+    // Screen 3 is the frontend's overlay image, which has its own alpha.
+    if (screen_id_l == 3) {
+        vec4 overlay = texture(screen_textures[3], frag_tex_coord);
+        color = vec4(overlay.rgb, overlay.a * Coverage());
+        return;
+    }
     color = vec4(GetScreen(screen_id_l).rgb, Coverage());
 }

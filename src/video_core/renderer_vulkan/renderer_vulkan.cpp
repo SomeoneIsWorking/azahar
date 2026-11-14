@@ -72,7 +72,7 @@ constexpr std::array<f32, 4 * 4> MakeOrthographicMatrix(u32 width, u32 height) {
 }
 
 constexpr static std::array<vk::DescriptorSetLayoutBinding, 1> PRESENT_BINDINGS = {{
-    {0, vk::DescriptorType::eCombinedImageSampler, 3, vk::ShaderStageFlagBits::eFragment},
+    {0, vk::DescriptorType::eCombinedImageSampler, 4, vk::ShaderStageFlagBits::eFragment},
 }};
 
 namespace {
@@ -171,6 +171,8 @@ RendererVulkan::~RendererVulkan() {
         vmaDestroyImage(instance.GetAllocator(), info.texture.image, info.texture.allocation);
     }
 
+    DestroyOverlayTexture();
+
     device.destroyPipeline(cursor_pipeline);
     device.destroyShaderModule(cursor_vertex_shader);
     device.destroyShaderModule(cursor_fragment_shader);
@@ -202,11 +204,14 @@ void RendererVulkan::PrepareRendertarget() {
 
 void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout) {
     const auto sampler = present_samplers[!Settings::values.filter_mode.GetValue()];
+    UpdateOverlayTexture();
     const auto present_set = present_heap.Commit();
     for (u32 index = 0; index < screen_infos.size(); index++) {
         update_queue.AddImageSampler(present_set, 0, index, screen_infos[index].image_view,
                                      sampler);
     }
+    update_queue.AddImageSampler(present_set, 0, OVERLAY_SCREEN_ID, overlay_texture.image_view,
+                                 present_samplers[1]);
 
     renderpass_cache.EndRendering();
     scheduler.Record([this, layout, frame, present_set,
@@ -922,6 +927,188 @@ void RendererVulkan::ApplySecondLayerOpacity(float alpha) {
     layer_opacity = alpha;
 }
 
+void RendererVulkan::DestroyOverlayTexture() {
+    if (overlay_texture.image_view) {
+        instance.GetDevice().destroyImageView(overlay_texture.image_view);
+        overlay_texture.image_view = nullptr;
+    }
+    if (overlay_texture.image) {
+        vmaDestroyImage(instance.GetAllocator(), overlay_texture.image,
+                        overlay_texture.allocation);
+        overlay_texture.image = nullptr;
+    }
+}
+
+void RendererVulkan::UpdateOverlayTexture() {
+    // Without an image the binding still needs a texture: one clear pixel.
+    static constexpr std::array<u8, 4> CLEAR_PIXEL{};
+    const auto image = Settings::values.overlay_image;
+    const bool usable = image && image->width != 0 && image->height != 0 &&
+                        image->rgba.size() == std::size_t{image->width} * image->height * 4;
+    const u32 width = usable ? image->width : 1;
+    const u32 height = usable ? image->height : 1;
+    const u64 generation = usable ? image->generation : 0;
+    const u8* pixels = usable ? image->rgba.data() : CLEAR_PIXEL.data();
+    if (overlay_texture.image && overlay_generation == generation &&
+        overlay_texture.width == width && overlay_texture.height == height) {
+        return;
+    }
+
+    const vk::Device device = instance.GetDevice();
+    // The image and the staging buffer below may still be in use by recorded commands.
+    scheduler.Finish();
+    if (overlay_texture.width != width || overlay_texture.height != height ||
+        !overlay_texture.image) {
+        DestroyOverlayTexture();
+        const vk::ImageCreateInfo image_info = {
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+        };
+        const VmaAllocationCreateInfo alloc_info = {
+            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        };
+        VkImage unsafe_image{};
+        const VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
+        const VkResult result =
+            vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
+                           &unsafe_image, &overlay_texture.allocation, nullptr);
+        if (result != VK_SUCCESS) [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating the overlay image with error {}",
+                         result);
+            UNREACHABLE();
+        }
+        overlay_texture.image = vk::Image{unsafe_image};
+        overlay_texture.image_view = device.createImageView({
+            .image = overlay_texture.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        });
+        overlay_texture.width = width;
+        overlay_texture.height = height;
+    }
+    overlay_generation = generation;
+
+    const vk::DeviceSize size = vk::DeviceSize{width} * height * 4;
+    const vk::BufferCreateInfo buffer_info = {
+        .size = size,
+        .usage = vk::BufferUsageFlagBits::eTransferSrc,
+    };
+    const VmaAllocationCreateInfo buffer_alloc_info = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VkBuffer unsafe_buffer{};
+    VmaAllocation buffer_allocation{};
+    VmaAllocationInfo buffer_allocation_info{};
+    const VkBufferCreateInfo unsafe_buffer_info = static_cast<VkBufferCreateInfo>(buffer_info);
+    const VkResult result =
+        vmaCreateBuffer(instance.GetAllocator(), &unsafe_buffer_info, &buffer_alloc_info,
+                        &unsafe_buffer, &buffer_allocation, &buffer_allocation_info);
+    if (result != VK_SUCCESS) [[unlikely]] {
+        LOG_CRITICAL(Render_Vulkan, "Failed allocating the overlay upload with error {}", result);
+        UNREACHABLE();
+    }
+    std::memcpy(buffer_allocation_info.pMappedData, pixels, size);
+    vmaFlushAllocation(instance.GetAllocator(), buffer_allocation, 0, VK_WHOLE_SIZE);
+
+    renderpass_cache.EndRendering();
+    scheduler.Record([image = overlay_texture.image, buffer = vk::Buffer{unsafe_buffer}, width,
+                      height](vk::CommandBuffer cmdbuf) {
+        const vk::ImageSubresourceRange range = {
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        const vk::ImageMemoryBarrier pre_barrier = {
+            .srcAccessMask = vk::AccessFlagBits::eNone,
+            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = range,
+        };
+        const vk::ImageMemoryBarrier post_barrier = {
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = range,
+        };
+        const vk::BufferImageCopy copy = {
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageExtent = {width, height, 1},
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
+        cmdbuf.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal, copy);
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eFragmentShader,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+    });
+    // The copy has run by the time the buffer goes.
+    scheduler.Finish();
+    vmaDestroyBuffer(instance.GetAllocator(), unsafe_buffer, buffer_allocation);
+}
+
+void RendererVulkan::DrawOverlayQuad(const Settings::OverlayQuad& quad) {
+    const float u0 = quad.source_x / static_cast<float>(overlay_texture.width);
+    const float u1 = (quad.source_x + quad.source_width) / static_cast<float>(overlay_texture.width);
+    const float v0 = quad.source_y / static_cast<float>(overlay_texture.height);
+    const float v1 =
+        (quad.source_y + quad.source_height) / static_cast<float>(overlay_texture.height);
+    std::array<ScreenRectVertex, 4> vertices = {{
+        ScreenRectVertex(quad.x, quad.y, u0, v0),
+        ScreenRectVertex(quad.x + quad.width, quad.y, u1, v0),
+        ScreenRectVertex(quad.x, quad.y + quad.height, u0, v1),
+        ScreenRectVertex(quad.x + quad.width, quad.y + quad.height, u1, v1),
+    }};
+    ShapeRect(vertices, quad.width, quad.height, 0.0f, quad.opacity);
+
+    const u64 size = sizeof(ScreenRectVertex) * vertices.size();
+    auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
+    std::memcpy(data, vertices.data(), size);
+    vertex_buffer.Commit(size);
+
+    draw_info.screen_id_l = OVERLAY_SCREEN_ID;
+
+    scheduler.Record([this, offset = offset, info = draw_info](vk::CommandBuffer cmdbuf) {
+        const u32 first_vertex = static_cast<u32>(offset) / sizeof(ScreenRectVertex);
+        cmdbuf.pushConstants(*present_pipeline_layout,
+                             vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
+                             0, sizeof(info), &info);
+
+        cmdbuf.bindVertexBuffers(0, vertex_buffer.Handle(), {0});
+        cmdbuf.draw(4, 1, first_vertex, 0);
+    });
+}
+
 void RendererVulkan::DrawScreenPiece(u32 screen_id, const Settings::ScreenPiece& piece) {
     const ScreenInfo& screen_info = screen_infos[screen_id];
     const auto& texcoords = screen_info.texcoords;
@@ -1139,6 +1326,10 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         } else {
             DrawBottomScreen(layout, additional_screen);
         }
+    }
+
+    for (const Settings::OverlayQuad& quad : Settings::values.overlay_quads) {
+        DrawOverlayQuad(quad);
     }
 
     DrawCursor(layout);

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <string>
 #include <unordered_map>
+#include <memory>
 #include <vector>
 #include "audio_core/input_details.h"
 #include "audio_core/sink_details.h"
@@ -487,6 +488,28 @@ struct ScreenPiece {
     float opacity;
 };
 
+// An image the frontend draws over the screens: 8-bit RGBA rows, alpha not premultiplied. The
+// renderer uploads it again when `generation` changes.
+struct OverlayImage {
+    u32 width{};
+    u32 height{};
+    u64 generation{};
+    std::vector<u8> rgba;
+};
+
+// A rectangle of the overlay image, in its pixels, drawn at a rectangle of the window.
+struct OverlayQuad {
+    float source_x{};
+    float source_y{};
+    float source_width{};
+    float source_height{};
+    float x{};
+    float y{};
+    float width{};
+    float height{};
+    float opacity{1.0f};
+};
+
 struct Values {
     // Controls
     InputProfile current_input_profile;       ///< The current input profile
@@ -673,6 +696,9 @@ struct Values {
     // With any, the custom layout draws these instead of the whole bottom screen; its bottom
     // rectangle still maps touches.
     std::vector<ScreenPiece> custom_bottom_pieces;
+    // Drawn after the screens, in order, whatever the layout.
+    std::shared_ptr<const OverlayImage> overlay_image;
+    std::vector<OverlayQuad> overlay_quads;
     Setting<bool> delay_start_for_lle_modules{true, Keys::delay_start_for_lle_modules};
     Setting<bool> use_gdbstub{false, Keys::use_gdbstub};
     Setting<u16> gdbstub_port{24689, Keys::gdbstub_port};
