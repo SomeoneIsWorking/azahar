@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <json.hpp>
 #include "common/file_util.h"
 #include "common/literals.h"
@@ -95,6 +96,8 @@ void CustomTexManager::FindCustomTextures() {
 
     const u64 title_id = system.Kernel().GetCurrentProcess()->codeset->program_id;
     const auto textures = GetTextures(title_id);
+    const std::string variants_path = fmt::format(
+        "{}textures/{:016X}/variants/", GetUserPath(FileUtil::UserPath::LoadDir), title_id);
     if (!ReadConfig(title_id)) {
         use_new_hash = false;
         skip_mipmap = true;
@@ -110,8 +113,15 @@ void CustomTexManager::FindCustomTextures() {
         if (!ParseFilename(file, texture)) {
             continue;
         }
+        // A file under variants/<name>/ stands in for the pack's only while <name> is selected.
+        auto* map = &material_map;
+        if (file.physicalName.starts_with(variants_path)) {
+            const std::string_view rest =
+                std::string_view{file.physicalName}.substr(variants_path.size());
+            map = &variant_maps[std::string{rest.substr(0, rest.find('/'))}];
+        }
         for (const u64 hash : texture->hashes) {
-            auto& material = material_map[hash];
+            auto& material = (*map)[hash];
             if (!material) {
                 material = std::make_unique<Material>();
             }
@@ -288,12 +298,31 @@ void CustomTexManager::DumpTexture(const SurfaceParams& params, u32 level, std::
 }
 
 Material* CustomTexManager::GetMaterial(u64 data_hash) {
+    if (const auto selected = variant_maps.find(variant); selected != variant_maps.end()) {
+        if (const auto it = selected->second.find(data_hash); it != selected->second.end()) {
+            return it->second.get();
+        }
+    }
     const auto it = material_map.find(data_hash);
     if (it == material_map.end()) {
         LOG_WARNING(Render, "Unable to find replacement for surface with hash {:016X}", data_hash);
         return nullptr;
     }
     return it->second.get();
+}
+
+bool CustomTexManager::SelectVariant(const std::string& name) {
+    if (name == variant) {
+        return false;
+    }
+    const bool changed = variant_maps.contains(variant) || variant_maps.contains(name);
+    variant = name;
+    return changed;
+}
+
+bool CustomTexManager::HasVariant(u64 data_hash) const {
+    return std::ranges::any_of(
+        variant_maps, [data_hash](const auto& entry) { return entry.second.contains(data_hash); });
 }
 
 bool CustomTexManager::Decode(Material* material, std::function<bool()>&& upload) {

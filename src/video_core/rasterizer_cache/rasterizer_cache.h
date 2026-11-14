@@ -124,6 +124,29 @@ void RasterizerCache<T>::TickFrame() {
         }
         UnregisterAll();
     }
+
+    if (custom_tex_manager.SelectVariant(Settings::values.custom_texture_variant)) {
+        UnregisterVariantSurfaces();
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::UnregisterVariantSurfaces() {
+    // A replaced texture is read from guest memory, so it is dropped without a flush and its
+    // next use uploads the selected variant's image.
+    std::vector<SurfaceId> replaced;
+    for (const auto& [page, surfaces] : page_table) {
+        for (const SurfaceId surface_id : surfaces) {
+            const Surface& surface = slot_surfaces[surface_id];
+            if (surface.IsCustom() && custom_tex_manager.HasVariant(surface.material->hash) &&
+                std::ranges::find(replaced, surface_id) == replaced.end()) {
+                replaced.push_back(surface_id);
+            }
+        }
+    }
+    for (const SurfaceId surface_id : replaced) {
+        UnregisterSurface(surface_id);
+    }
 }
 
 template <class T>

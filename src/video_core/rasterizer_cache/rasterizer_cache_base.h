@@ -207,6 +207,9 @@ private:
     /// Unregisters all surfaces from the cache
     void UnregisterAll();
 
+    /// Unregisters the replaced textures that a texture variant changes
+    void UnregisterVariantSurfaces();
+
     /// Increase/decrease the number of surface in pages touching the specified region
     void UpdatePagesCachedCount(PAddr addr, u32 size, int delta);
 

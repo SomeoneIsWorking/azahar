@@ -53,8 +53,15 @@ public:
     /// Saves the provided pixel data described by params to disk as png
     void DumpTexture(const SurfaceParams& params, u32 level, std::span<u8> data, u64 data_hash);
 
-    /// Returns the material assigned to the provided data hash
+    /// Returns the material assigned to the provided data hash, the selected variant's first
     Material* GetMaterial(u64 data_hash);
+
+    /// Selects the variant whose textures stand in for the pack's (variants/<name>/ in the
+    /// pack; empty for none). Returns whether any texture changed.
+    bool SelectVariant(const std::string& name);
+
+    /// True when some variant replaces the texture with this hash
+    bool HasVariant(u64 data_hash) const;
 
     /// Decodes the textures in material to a consumable format and uploads it.
     bool Decode(Material* material, std::function<bool()>&& upload);
@@ -84,6 +91,9 @@ private:
     Frontend::ImageInterface& image_interface;
     std::unordered_set<u64> dumped_textures;
     std::unordered_map<u64, std::unique_ptr<Material>> material_map;
+    std::unordered_map<std::string, std::unordered_map<u64, std::unique_ptr<Material>>>
+        variant_maps;
+    std::string variant;
     std::unordered_map<std::string, std::vector<u64>> path_to_hash_map;
     std::vector<std::unique_ptr<CustomTexture>> custom_textures;
     std::list<AsyncUpload> async_uploads;

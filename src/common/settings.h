@@ -696,6 +696,9 @@ struct Values {
     // With any, the custom layout draws these instead of the whole bottom screen; its bottom
     // rectangle still maps touches.
     std::vector<ScreenPiece> custom_bottom_pieces;
+    // The custom texture pack's variant (variants/<name>/ in it) used over its own textures;
+    // empty for none. Changing it reloads only the textures a variant replaces.
+    std::string custom_texture_variant;
     // Drawn after the screens, in order, whatever the layout.
     std::shared_ptr<const OverlayImage> overlay_image;
     std::vector<OverlayQuad> overlay_quads;
