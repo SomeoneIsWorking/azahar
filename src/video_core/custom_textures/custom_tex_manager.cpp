@@ -409,7 +409,8 @@ std::vector<FileUtil::FSTEntry> CustomTexManager::GetTextures(u64 title_id) {
 
     FileUtil::FSTEntry texture_dir;
     std::vector<FileUtil::FSTEntry> textures;
-    FileUtil::ScanDirectoryTree(load_path, texture_dir, 64);
+    // Without the separator, so each file's physical name has a single one after the folder.
+    FileUtil::ScanDirectoryTree(load_path.substr(0, load_path.size() - 1), texture_dir, 64);
     FileUtil::GetAllFilesFromNestedEntries(texture_dir, textures);
     return textures;
 }
