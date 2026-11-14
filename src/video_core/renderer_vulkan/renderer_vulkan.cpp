@@ -1393,9 +1393,14 @@ bool RendererVulkan::TryRenderScreenshotWithHostMemory() {
             },
         };
 
-    // Import host memory
-    const vk::UniqueDeviceMemory imported_memory =
-        device.allocateMemoryUnique(allocation_chain.get());
+    // Import host memory. The driver may refuse these pages at any time (radv: the kernel could
+    // not pin them), which leaves the staging copy.
+    vk::DeviceMemory imported;
+    if (device.allocateMemory(&allocation_chain.get(), nullptr, &imported) !=
+        vk::Result::eSuccess) {
+        return false;
+    }
+    const vk::UniqueDeviceMemory imported_memory{imported, device};
 
     const vk::StructureChain<vk::BufferCreateInfo, vk::ExternalMemoryBufferCreateInfo> buffer_info =
         {
