@@ -388,13 +388,20 @@ void Module::UpdateGyroscopeCallback(std::uintptr_t user_data, s64 cycles_late) 
         gyroscope_entry.y = data.gyro_y;
         gyroscope_entry.z = data.gyro_z;
     } else {
-        Common::Vec3<float> gyro;
-        std::tie(std::ignore, gyro) = motion_device->GetStatus();
-        double stretch = system.perf_stats->GetLastFrameTimeScale();
-        gyro *= gyroscope_coef * static_cast<float>(stretch);
-        gyroscope_entry.x = static_cast<s16>(gyro.x);
-        gyroscope_entry.y = static_cast<s16>(gyro.y);
-        gyroscope_entry.z = static_cast<s16>(gyro.z);
+        if (const auto sample = motion_device->TakeGyroscopeSample()) {
+            const Common::Vec3<float> gyro = *sample * gyroscope_coef;
+            gyroscope_entry.x = static_cast<s16>(std::lround(gyro.x));
+            gyroscope_entry.y = static_cast<s16>(std::lround(gyro.y));
+            gyroscope_entry.z = static_cast<s16>(std::lround(gyro.z));
+        } else {
+            Common::Vec3<float> gyro;
+            std::tie(std::ignore, gyro) = motion_device->GetStatus();
+            double stretch = system.perf_stats->GetLastFrameTimeScale();
+            gyro *= gyroscope_coef * static_cast<float>(stretch);
+            gyroscope_entry.x = static_cast<s16>(gyro.x);
+            gyroscope_entry.y = static_cast<s16>(gyro.y);
+            gyroscope_entry.z = static_cast<s16>(gyro.z);
+        }
     }
 
     system.Movie().HandleGyroscopeStatus(gyroscope_entry);

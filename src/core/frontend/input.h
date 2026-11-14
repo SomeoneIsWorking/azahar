@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -124,7 +125,18 @@ using AnalogDevice = InputDevice<std::tuple<float, float>>;
  *   Orientation is determined by right-hand rule.
  *   Units: deg/sec
  */
-using MotionDevice = InputDevice<std::tuple<Common::Vec3<float>, Common::Vec3<float>>>;
+class MotionDevice : public InputDevice<std::tuple<Common::Vec3<float>, Common::Vec3<float>>> {
+public:
+    /**
+     * The angular rate of one gyroscope sample of the HID service, in deg/sec of emulated time.
+     * The service calls this once per sample and takes the rate as it is, rounded to its raw
+     * unit, without the stretch by the host's frame time. Devices that report a rate measured in
+     * host time return nothing and are read through GetStatus.
+     */
+    virtual std::optional<Common::Vec3<float>> TakeGyroscopeSample() {
+        return std::nullopt;
+    }
+};
 
 /**
  * A touch device is an input device that returns a tuple of two floats and a bool. The floats are
