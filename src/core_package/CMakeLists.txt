@@ -5,6 +5,11 @@ add_library(azahar_core SHARED core_package.cpp)
 add_library(AzaharCore::azahar_core ALIAS azahar_core)
 target_link_libraries(azahar_core PRIVATE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,citra_common,citra_core,video_core,audio_core>")
+if (APPLE)
+    # common's Apple helpers (apple_utils.mm) call AppKit and CoreGraphics, which a frontend outside
+    # this tree does not link.
+    target_link_libraries(azahar_core PRIVATE "-framework AppKit" "-framework Foundation" "-framework CoreGraphics")
+endif()
 
 get_directory_property(core_definitions COMPILE_DEFINITIONS)
 target_compile_definitions(azahar_core INTERFACE ${core_definitions})

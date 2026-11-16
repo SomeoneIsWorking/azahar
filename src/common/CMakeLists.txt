@@ -121,7 +121,9 @@ if (UNIX AND NOT APPLE)
 endif()
 
 if (APPLE AND NOT ENABLE_LIBRETRO)
-  target_sources(citra_common PUBLIC
+  # PRIVATE: as PUBLIC every library linking common compiled its own copy, and the whole-archive
+  # core package (core_package/) then had five of each symbol.
+  target_sources(citra_common PRIVATE
     apple_authorization.h
     apple_authorization.cpp
     apple_utils.cpp
