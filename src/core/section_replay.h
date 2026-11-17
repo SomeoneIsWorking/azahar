@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -62,9 +63,16 @@ public:
         // Made by another thread while the section's thread waited.
         bool other_thread = false;
     };
+    // A call through an observed branch site while the real section ran, with its first four
+    // arguments.
+    struct Call {
+        VAddr site;
+        std::array<u32, 4> args;
+    };
     // What the real section reached besides memory: each SVC it made, in order.
     struct Census {
         std::vector<Svc> svcs;
+        std::vector<Call> calls;
         std::size_t pages = 0;
         u64 held_reads = 0;
         // Host time from the call to the return, other threads' slices included.
@@ -79,6 +87,8 @@ public:
 
     // Hooks the section's sites; the handler runs after each real section returns.
     bool Install(VAddr open_site, VAddr close_site, Handler handler);
+    // Records the calls the real section makes through a branch site (SectionCensus().calls).
+    bool Observe(VAddr site);
     void Uninstall();
 
     // Inside the handler. Replays the section from its starting state with `inputs` written, calls
@@ -120,7 +130,7 @@ public:
     void Reset();
 
 private:
-    enum class Hook : u32 { Open, Close };
+    enum class Hook : u32 { Open, Close, Observe };
     static constexpr u64 ReplayTickLimit = 400'000'000;
 
     void AtSite(ARM_Interface& cpu, Hook hook);
@@ -135,6 +145,7 @@ private:
     std::map<VAddr, Hook> hooks;
     VAddr open_site = 0;
     VAddr close_site = 0;
+    std::vector<VAddr> observed_sites;
     Handler handler;
 
     std::unique_ptr<Memory::StoreJournal> section;

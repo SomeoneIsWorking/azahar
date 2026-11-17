@@ -80,16 +80,34 @@ bool SectionReplay::Install(VAddr open_site_, VAddr close_site_, Handler handler
     return true;
 }
 
+bool SectionReplay::Observe(VAddr site) {
+    if (open_site == 0 || !DecodeBranch(site, system.Memory().Read32(site))) {
+        LOG_ERROR(Core,
+                  "observed site {:08X} is not an ARM B, BL or BLX, or no section is installed",
+                  site);
+        return false;
+    }
+    hooks[site] = Hook::Observe;
+    observed_sites.push_back(site);
+    for (u32 core = 0; core < system.GetNumCores(); ++core) {
+        system.GetCore(core).InvalidateCacheRange(site, 4);
+    }
+    return true;
+}
+
 void SectionReplay::Uninstall() {
     if (open_site == 0) {
         return;
     }
-    hooks.erase(open_site);
-    hooks.erase(close_site);
-    for (u32 core = 0; core < system.GetNumCores(); ++core) {
-        system.GetCore(core).InvalidateCacheRange(open_site, 4);
-        system.GetCore(core).InvalidateCacheRange(close_site, 4);
+    observed_sites.push_back(open_site);
+    observed_sites.push_back(close_site);
+    for (const VAddr site : observed_sites) {
+        hooks.erase(site);
+        for (u32 core = 0; core < system.GetNumCores(); ++core) {
+            system.GetCore(core).InvalidateCacheRange(site, 4);
+        }
     }
+    observed_sites.clear();
     open_site = 0;
     close_site = 0;
     handler = nullptr;
@@ -131,6 +149,7 @@ bool SectionReplay::OnSvc(ARM_Interface& cpu, u32 immediate) {
         switch (hook) {
         case Hook::Open:
         case Hook::Close:
+        case Hook::Observe:
             AtSite(cpu, hook);
             break;
         default:
@@ -179,10 +198,17 @@ void SectionReplay::AtSite(ARM_Interface& cpu, Hook hook) {
     ASSERT(branch);
     const VAddr target = branch->reg ? cpu.GetReg(*branch->reg) : branch->target;
     ASSERT_MSG((target & 1) == 0, "section site {:08X} branches to Thumb", site);
+    if (hook == Hook::Observe && window_open && !replaying && OnWindowThread(cpu)) {
+        census.calls.push_back(
+            {site, {cpu.GetReg(0), cpu.GetReg(1), cpu.GetReg(2), cpu.GetReg(3)}});
+    }
     if (branch->link) {
         cpu.SetReg(14, site + 4);
     }
     cpu.SetPC(target);
+    if (hook == Hook::Observe) {
+        return;
+    }
     if (hook == Hook::Close) {
         if (replaying) {
             Stop(cpu, {});
