@@ -20,7 +20,14 @@ Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::Surfa
     : instance{instance_}, surface{surface_} {
     FindPresentFormat();
     SetPresentMode();
-    Create(width, height, surface, low_refresh_rate);
+    if (Settings::values.present_to_window) {
+        Create(width, height, surface, low_refresh_rate);
+        return;
+    }
+    // Made on the first present instead.
+    this->width = width;
+    this->height = height;
+    SetSurfaceProperties();
 }
 
 Swapchain::~Swapchain() {

@@ -80,12 +80,17 @@ class Timing;
 
 class System {
 public:
-    /**
-     * Gets the instance of the System singleton class.
-     * @returns Reference to the instance of the System singleton class.
-     */
+    /// The current system: the one the frontend steps, loads or presents. A frontend that runs
+    /// one system never changes it.
     [[nodiscard]] static System& GetInstance() {
-        return s_instance;
+        return *s_current;
+    }
+
+    /// Makes `system` the one GetInstance returns; a frontend running more than one system calls
+    /// it before stepping, loading or presenting another.
+    /// Null makes the process's own system current again.
+    static void MakeCurrent(System* system) {
+        s_current = system != nullptr ? system : &s_instance;
     }
 
     /// Enumeration representing the return values of the System Initialize and Load process.
@@ -532,6 +537,7 @@ private:
 
 private:
     static System s_instance;
+    static std::atomic<System*> s_current;
 
     Common::Event pending_work_event;
 

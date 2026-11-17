@@ -61,6 +61,7 @@
 namespace Core {
 
 /*static*/ System System::s_instance;
+/*static*/ std::atomic<System*> System::s_current{&System::s_instance};
 
 template <>
 Core::System& Global() {

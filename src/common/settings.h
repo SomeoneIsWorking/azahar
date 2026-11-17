@@ -702,6 +702,10 @@ struct Values {
     // Drawn after the screens, in order, whatever the layout.
     std::shared_ptr<const OverlayImage> overlay_image;
     std::vector<OverlayQuad> overlay_quads;
+    // Off, the renderer neither presents to the window nor holds a swapchain on it, so the
+    // frontend can draw there; frames still render and screenshots still work. Turned on, the
+    // next frame takes the window.
+    bool present_to_window{true};
     Setting<bool> delay_start_for_lle_modules{true, Keys::delay_start_for_lle_modules};
     Setting<bool> use_gdbstub{false, Keys::use_gdbstub};
     Setting<u16> gdbstub_port{24689, Keys::gdbstub_port};

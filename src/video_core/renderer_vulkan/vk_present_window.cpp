@@ -389,7 +389,8 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
     const bool size_changed =
         swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
     const bool vsync_changed = vsync_enabled != use_vsync;
-    if (vsync_changed || size_changed) [[unlikely]] {
+    const bool unmade = !swapchain.GetHandle();
+    if (vsync_changed || size_changed || unmade) [[unlikely]] {
         vsync_enabled = use_vsync;
         recreate_swapchain();
     }
