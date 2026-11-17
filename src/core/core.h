@@ -76,6 +76,7 @@ namespace Core {
 
 class ARM_Interface;
 class ExclusiveMonitor;
+class SectionReplay;
 class Timing;
 
 class System {
@@ -301,6 +302,9 @@ public:
 
     /// Gets a const reference to the memory system
     [[nodiscard]] const Memory::MemorySystem& Memory() const;
+
+    /// The draw section's replay owner (core/section_replay.h)
+    [[nodiscard]] SectionReplay& Replay();
 
     /// Gets a reference to the cheat engine
     [[nodiscard]] Cheats::CheatEngine& CheatEngine();
@@ -530,6 +534,7 @@ private:
     std::unique_ptr<Service::FS::ArchiveManager> archive_manager;
 
     std::unique_ptr<Memory::MemorySystem> memory;
+    std::unique_ptr<SectionReplay> section_replay;
     std::unique_ptr<Kernel::KernelSystem> kernel;
     std::unique_ptr<Timing> timing;
 

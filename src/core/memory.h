@@ -28,6 +28,8 @@ class DspInterface;
 
 namespace Memory {
 
+class StoreJournal;
+
 /**
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
  * be mapped.
@@ -95,6 +97,11 @@ struct PageTable {
             return refs[idx];
         }
 
+        // The page's memory whatever its pointer holds.
+        u8* Backing(std::size_t idx) {
+            return refs[idx].GetPtr();
+        }
+
     private:
         std::array<u8*, PAGE_TABLE_NUM_ENTRIES> raw;
         std::array<MemoryRef, PAGE_TABLE_NUM_ENTRIES> refs;
@@ -105,7 +112,8 @@ struct PageTable {
 
     /**
      * Array of fine grained page attributes. If it is set to any value other than `Memory`, then
-     * the corresponding entry in `pointers` MUST be set to null.
+     * the corresponding entry in `pointers` MUST be set to null. A `Memory` page with a null
+     * pointer is held by an armed StoreJournal; its backing is `pointers.Ref`.
      */
     std::array<PageType, PAGE_TABLE_NUM_ENTRIES> attributes;
 
@@ -709,6 +717,9 @@ public:
     /// Called after a guest write lands on a watchpoint page; the observer filters by address.
     using WriteObserver = std::function<void(VAddr vaddr, u32 size, u64 value)>;
     void SetWriteObserver(WriteObserver observer);
+
+    /// Every store through this memory system saves its page in the journal first; null for none.
+    void SetStoreJournal(StoreJournal* journal);
 
 private:
     template <typename T>

@@ -491,6 +491,10 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     precompiled_headers.h
     savestate.cpp
     savestate.h
+    section_replay.cpp
+    section_replay.h
+    store_journal.cpp
+    store_journal.h
     system_titles.cpp
     system_titles.h
     tracer/citrace.h

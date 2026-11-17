@@ -26,6 +26,7 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/memory.h"
+#include "core/store_journal.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
@@ -119,8 +120,37 @@ public:
 
     PAddr plugin_fb_address{};
     WriteObserver write_observer;
+    StoreJournal* journal = nullptr;
 
     Impl(Core::System& system_);
+
+    // Before a store to the page: the journal saves it and an armed page gets its pointer back.
+    void JournalStore(PageTable& page_table, std::size_t page_index) {
+        if (journal == nullptr) [[likely]] {
+            return;
+        }
+        u8* host = nullptr;
+        switch (page_table.attributes[page_index]) {
+        case PageType::Memory:
+            host = page_table.pointers.Backing(page_index);
+            break;
+        case PageType::MemoryWatchpoint: {
+            auto it = page_table.watchpoint_pages_map.find(page_index);
+            if (it != page_table.watchpoint_pages_map.end()) {
+                host = it->second.memory.GetPtr();
+            }
+            break;
+        }
+        case PageType::RasterizerCachedMemory:
+        case PageType::RasterizerCachedMemoryWatchpoint:
+            host = GetPointerForRasterizerCache(static_cast<VAddr>(page_index << CITRA_PAGE_BITS))
+                       .GetPtr();
+            break;
+        default:
+            return;
+        }
+        journal->Touch(page_table, page_index, host);
+    }
 
     const u8* GetPtr(Region r) const {
         switch (r) {
@@ -196,9 +226,7 @@ public:
                 break;
             }
             case PageType::Memory: {
-                DEBUG_ASSERT(page_table.pointers[page_index]);
-
-                const u8* src_ptr = page_table.pointers[page_index] + page_offset;
+                const u8* src_ptr = page_table.pointers.Backing(page_index) + page_offset;
                 std::memcpy(dest_buffer, src_ptr, copy_amount);
                 break;
             }
@@ -244,6 +272,7 @@ public:
             const VAddr current_vaddr =
                 static_cast<VAddr>((page_index << CITRA_PAGE_BITS) + page_offset);
 
+            JournalStore(page_table, page_index);
             switch (page_table.attributes[page_index]) {
             case PageType::Unmapped: {
                 LOG_ERROR(
@@ -254,9 +283,7 @@ public:
                 break;
             }
             case PageType::Memory: {
-                DEBUG_ASSERT(page_table.pointers[page_index]);
-
-                u8* dest_ptr = page_table.pointers[page_index] + page_offset;
+                u8* dest_ptr = page_table.pointers.Backing(page_index) + page_offset;
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
                 break;
             }
@@ -632,9 +659,17 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
             return T{};
         }
     }
-    case PageType::Memory:
-        ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
-        break;
+    case PageType::Memory: {
+        if (impl->journal != nullptr) {
+            impl->journal->CountRead();
+        }
+        ReadType value;
+        std::memcpy(&value,
+                    page_table->pointers.Backing(vaddr >> CITRA_PAGE_BITS) +
+                        (vaddr & CITRA_PAGE_MASK),
+                    read_size);
+        return value;
+    }
     case PageType::MemoryWatchpoint: {
         auto it = page_table->watchpoint_pages_map.find(vaddr >> CITRA_PAGE_BITS);
         ASSERT_MSG(it != page_table->watchpoint_pages_map.end(),
@@ -716,13 +751,16 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
         // Fallthrough: Standard page table lookup
     }
 
+    impl->JournalStore(*page_table, vaddr >> CITRA_PAGE_BITS);
     PageType type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
     switch (type) {
     case PageType::Unmapped:
         (void)UnmappedAccess<T>(vaddr, data, false);
         return;
     case PageType::Memory:
-        ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
+        std::memcpy(page_table->pointers.Backing(vaddr >> CITRA_PAGE_BITS) +
+                        (vaddr & CITRA_PAGE_MASK),
+                    &data, sizeof(T));
         break;
     case PageType::MemoryWatchpoint: {
         auto it = page_table->watchpoint_pages_map.find(vaddr >> CITRA_PAGE_BITS);
@@ -770,6 +808,10 @@ void MemorySystem::NotifyWrite(const VAddr vaddr, const T data) {
     }
 }
 
+void MemorySystem::SetStoreJournal(StoreJournal* journal) {
+    impl->journal = journal;
+}
+
 void MemorySystem::SetWriteObserver(WriteObserver observer) {
     impl->write_observer = std::move(observer);
 }
@@ -784,14 +826,18 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
         return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);
     }
 
+    impl->JournalStore(*impl->current_page_table, vaddr >> CITRA_PAGE_BITS);
     PageType type = impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS];
     switch (type) {
     case PageType::Unmapped:
         (void)UnmappedAccess<T>(vaddr, data, false);
         return true;
-    case PageType::Memory:
-        ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
-        return true;
+    case PageType::Memory: {
+        const auto volatile_pointer = reinterpret_cast<volatile T*>(
+            impl->current_page_table->pointers.Backing(vaddr >> CITRA_PAGE_BITS) +
+            (vaddr & CITRA_PAGE_MASK));
+        return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);
+    }
     case PageType::MemoryWatchpoint: {
         auto it = impl->current_page_table->watchpoint_pages_map.find(vaddr >> CITRA_PAGE_BITS);
         ASSERT_MSG(it != impl->current_page_table->watchpoint_pages_map.end(),
@@ -860,6 +906,12 @@ u8* MemorySystem::GetPointer(const VAddr vaddr) {
         return page_pointer + (vaddr & CITRA_PAGE_MASK);
     }
 
+    if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] == PageType::Memory) {
+        impl->JournalStore(*impl->current_page_table, vaddr >> CITRA_PAGE_BITS);
+        return impl->current_page_table->pointers.Backing(vaddr >> CITRA_PAGE_BITS) +
+               (vaddr & CITRA_PAGE_MASK);
+    }
+
     if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
             PageType::RasterizerCachedMemory ||
         impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
@@ -875,6 +927,11 @@ const u8* MemorySystem::GetPointer(const VAddr vaddr) const {
     const u8* page_pointer = impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS];
     if (page_pointer) {
         return page_pointer + (vaddr & CITRA_PAGE_MASK);
+    }
+
+    if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] == PageType::Memory) {
+        return impl->current_page_table->pointers.Backing(vaddr >> CITRA_PAGE_BITS) +
+               (vaddr & CITRA_PAGE_MASK);
     }
 
     if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
@@ -1045,6 +1102,10 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                         if (page_type == PageType::Memory) {
                             page_table->pointers[vaddr >> CITRA_PAGE_BITS] =
                                 GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
+                            if (impl->journal != nullptr &&
+                                impl->journal->Holds(*page_table, vaddr >> CITRA_PAGE_BITS)) {
+                                page_table->GetPointerArray()[vaddr >> CITRA_PAGE_BITS] = nullptr;
+                            }
                         }
                         break;
                     }
@@ -1178,6 +1239,7 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
         const VAddr current_vaddr =
             static_cast<VAddr>((page_index << CITRA_PAGE_BITS) + page_offset);
 
+        impl->JournalStore(page_table, page_index);
         switch (page_table.attributes[page_index]) {
         case PageType::Unmapped: {
             LOG_ERROR(HW_Memory,
@@ -1187,9 +1249,7 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
             break;
         }
         case PageType::Memory: {
-            DEBUG_ASSERT(page_table.pointers[page_index]);
-
-            u8* dest_ptr = page_table.pointers[page_index] + page_offset;
+            u8* dest_ptr = page_table.pointers.Backing(page_index) + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
             break;
         }
@@ -1247,8 +1307,7 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
             break;
         }
         case PageType::Memory: {
-            DEBUG_ASSERT(page_table.pointers[page_index]);
-            const u8* src_ptr = page_table.pointers[page_index] + page_offset;
+            const u8* src_ptr = page_table.pointers.Backing(page_index) + page_offset;
             WriteBlock(dest_process, dest_addr, src_ptr, copy_amount);
             break;
         }

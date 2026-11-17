@@ -50,6 +50,7 @@
 #include "core/loader/loader.h"
 #include "core/movie.h"
 #include "core/savestate.h"
+#include "core/section_replay.h"
 #ifdef ENABLE_SCRIPTING
 #include "core/rpc/server.h"
 #endif
@@ -205,7 +206,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         frame_limiter.WaitOnce();
         return ResultStatus::Success;
     } else if (save_state_request_status == SaveStateStatus::SAVING && kernel.get() &&
-               !kernel->AreAsyncOperationsPending()) {
+               !kernel->AreAsyncOperationsPending() && !section_replay->WindowOpen()) {
         save_state_request_status = SaveStateStatus::NONE;
         const u32 slot = save_state_slot;
         LOG_INFO(Core, "Begin save to slot {}", slot);
@@ -585,6 +586,10 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     LOG_DEBUG(HW_Memory, "initialized OK");
 
     memory = std::make_unique<Memory::MemorySystem>(*this);
+    if (!section_replay) {
+        section_replay = std::make_unique<SectionReplay>(*this);
+    }
+    section_replay->Reset();
 
     timing = std::make_unique<Timing>(num_cores, Settings::values.cpu_clock_percentage.GetValue(),
                                       movie.GetOverrideBaseTicks());
@@ -724,6 +729,10 @@ const Memory::MemorySystem& System::Memory() const {
     return *memory;
 }
 
+SectionReplay& System::Replay() {
+    return *section_replay;
+}
+
 Cheats::CheatEngine& System::CheatEngine() {
     return cheat_engine;
 }
@@ -776,6 +785,7 @@ void System::Shutdown(bool is_deserializing) {
 
     gpu.reset();
     if (!is_deserializing) {
+        section_replay.reset();
         lle_modules.clear();
 #ifdef ENABLE_GDBSTUB
         GDBStub::Shutdown();

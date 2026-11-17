@@ -20,6 +20,7 @@
 #endif
 #include "core/hle/kernel/svc.h"
 #include "core/memory.h"
+#include "core/section_replay.h"
 
 #ifndef SIGILL
 constexpr u32 SIGILL = 4;
@@ -32,12 +33,17 @@ constexpr u32 SIGTRAP = 5;
 namespace Core {
 
 class DynarmicUserCallbacks final : public Dynarmic::A32::UserCallbacks {
+    static constexpr u64 ReplaySliceTicks = 1'000'000;
+
 public:
     explicit DynarmicUserCallbacks(ARM_Dynarmic& parent)
         : parent(parent), svc_context(parent.system), memory(parent.memory) {}
     ~DynarmicUserCallbacks() = default;
 
     std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override {
+        if (const auto hook = parent.system.Replay().CodeAt(vaddr)) {
+            return hook;
+        }
         return memory.Read32OrNullopt(vaddr);
     }
 
@@ -87,10 +93,17 @@ public:
     }
 
     void CallSVC(std::uint32_t swi) override {
+        if (parent.system.Replay().OnSvc(parent, swi)) {
+            return;
+        }
         svc_context.CallSVC(swi);
     }
 
     void ExceptionRaised(VAddr pc, Dynarmic::A32::Exception exception) override {
+        if (parent.system.Replay().Replaying()) {
+            parent.system.Replay().OnException(parent, pc);
+            return;
+        }
         switch (exception) {
         case Dynarmic::A32::Exception::UndefinedInstruction:
         case Dynarmic::A32::Exception::UnpredictableInstruction:
@@ -161,9 +174,17 @@ public:
     }
 
     void AddTicks(std::uint64_t ticks) override {
+        // Guest time is held while a section replays.
+        if (parent.system.Replay().Replaying()) {
+            parent.system.Replay().CountTicks(ticks);
+            return;
+        }
         parent.GetTimer().AddTicks(ticks);
     }
     std::uint64_t GetTicksRemaining() override {
+        if (parent.system.Replay().Replaying()) {
+            return ReplaySliceTicks;
+        }
         s64 ticks = parent.GetTimer().GetDowncount();
         return static_cast<u64>(ticks <= 0 ? 0 : ticks);
     }
@@ -197,6 +218,7 @@ void ARM_Dynarmic::Run() {
     }
 
     jit->Run();
+    system.Replay().AfterRun(*this);
 }
 
 void ARM_Dynarmic::Step() {
