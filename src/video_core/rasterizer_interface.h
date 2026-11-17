@@ -61,6 +61,12 @@ public:
         return false;
     }
 
+    /// Makes screen `screen`'s in-between image from a display transfer, leaving the transfer's
+    /// output memory alone; it stands in for the frame before the one that will show at `shown_at`
+    virtual bool MakeInBetween(const Pica::DisplayTransferConfig&, u32 screen, PAddr shown_at) {
+        return false;
+    }
+
     /// Attempt to use a faster method to perform a display transfer with is_texture_copy = 1
     virtual bool AccelerateTextureCopy(const Pica::DisplayTransferConfig&) {
         return false;

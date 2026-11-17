@@ -27,11 +27,13 @@ namespace Core {
 
 class System;
 
-// Runs a title's draw section again inside a sandbox. A hooked call site (an ARM B or BL to the
-// section) opens a window: the section runs for real while a store journal saves every page it
-// writes. When it returns, outside the JIT, the handler may replay the section any number of times
-// from the state it started in, with inputs written over that state; each replay's stores are
-// journalled and rolled back, guest time is held, and any SVC or CPU exception refuses the replay.
+// Runs a title's draw section again inside a sandbox. The section runs from a branch (an ARM B, BL
+// or BLX register, the open site) up to another (the close site, which it does not run). While it
+// runs for real a store journal saves every page written. When it ends, outside the JIT, the
+// handler may replay the section any number of times from the state it started in, with inputs
+// written over that state; each replay's stores are journalled and rolled back and guest time is
+// held. An ArbitrateAddress signal does nothing in a replay; any other SVC or a CPU exception
+// refuses it.
 class SectionReplay {
 public:
     // A hook is the instruction run as `svc` with an immediate this far above the kernel's.
@@ -49,13 +51,16 @@ public:
         u64 held_reads = 0;
         s64 host_microseconds = 0;
     };
-    // An SVC the real section made; for SendSyncRequest, the session's name and the request's
-    // header.
+    // An SVC the real section made; for SendSyncRequest the session's name and the request's
+    // header, for ArbitrateAddress the address and the arbitration type.
     struct Svc {
         u32 number;
         VAddr pc;
         std::string service;
-        u32 header = 0;
+        u32 detail = 0;
+        VAddr address = 0;
+        // Made by another thread while the section's thread waited.
+        bool other_thread = false;
     };
     // What the real section reached besides memory: each SVC it made, in order.
     struct Census {
@@ -72,8 +77,8 @@ public:
     SectionReplay(const SectionReplay&) = delete;
     SectionReplay& operator=(const SectionReplay&) = delete;
 
-    // Hooks the call site; the handler runs after each real section returns.
-    bool Install(VAddr call_site, Handler handler);
+    // Hooks the section's sites; the handler runs after each real section returns.
+    bool Install(VAddr open_site, VAddr close_site, Handler handler);
     void Uninstall();
 
     // Inside the handler. Replays the section from its starting state with `inputs` written, calls
@@ -115,20 +120,21 @@ public:
     void Reset();
 
 private:
-    enum class Hook : u32 { CallSite, Return };
-    // The section and its replays return here, so the return address they push is the same.
-    static constexpr VAddr ReturnAddress = 0x00000F00;
+    enum class Hook : u32 { Open, Close };
     static constexpr u64 ReplayTickLimit = 400'000'000;
 
-    void OpenWindow(ARM_Interface& cpu);
+    void AtSite(ARM_Interface& cpu, Hook hook);
+    bool OpenWindow(ARM_Interface& cpu);
     void CloseWindow(ARM_Interface& cpu);
+    [[nodiscard]] bool OnWindowThread(ARM_Interface& cpu) const;
     void Stop(ARM_Interface& cpu, std::string refusal);
     Svc DescribeSvc(ARM_Interface& cpu, const Kernel::Thread& thread, u32 immediate);
     void SetJournal(Memory::StoreJournal* journal);
 
     System& system;
     std::map<VAddr, Hook> hooks;
-    VAddr call_site = 0;
+    VAddr open_site = 0;
+    VAddr close_site = 0;
     Handler handler;
 
     std::unique_ptr<Memory::StoreJournal> section;
@@ -139,8 +145,6 @@ private:
     u32 window_thread = 0;
     ARM_Interface* window_cpu = nullptr;
     ARM_Interface::ThreadContext start_context{};
-    VAddr target = 0;
-    VAddr return_address = 0;
     std::chrono::steady_clock::time_point opened;
 
     bool replaying = false;

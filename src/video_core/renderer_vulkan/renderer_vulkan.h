@@ -147,6 +147,9 @@ private:
     u32 current_pipeline = 0;
 
     std::array<ScreenInfo, 3> screen_infos{};
+    // The address each screen showed at the last vblank: an in-between shows on a repeat.
+    std::array<PAddr, 2> shown_addresses{};
+    bool showing_in_between = false;
     // Settings::values.overlay_image as uploaded: the present shaders' fourth texture.
     static constexpr u32 OVERLAY_SCREEN_ID = 3;
     TextureInfo overlay_texture{};

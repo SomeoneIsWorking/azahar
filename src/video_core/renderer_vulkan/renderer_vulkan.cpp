@@ -179,6 +179,8 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::PrepareRendertarget() {
+    const bool after_in_between = showing_in_between;
+    showing_in_between = false;
     const auto& framebuffer_config = pica.regs.framebuffer_config;
     const auto& regs_lcd = pica.regs_lcd;
     for (u32 i = 0; i < 3; i++) {
@@ -199,6 +201,17 @@ void RendererVulkan::PrepareRendertarget() {
         }
 
         LoadFBToScreenInfo(framebuffer, screen_infos[i], i == 1);
+        if (i != 1) {
+            const PAddr shown =
+                framebuffer.active_fb == 0 ? framebuffer.address_left1 : framebuffer.address_left2;
+            showing_in_between |= rasterizer.TakeInBetween(
+                fb_id, shown, shown != shown_addresses[fb_id], screen_infos[i]);
+            shown_addresses[fb_id] = shown;
+        }
+    }
+    // An in-between and the frame after it are new to the window, though not new game frames.
+    if (showing_in_between || after_in_between) {
+        Core::PerfStats::game_frames_updated = true;
     }
 }
 
@@ -936,8 +949,7 @@ void RendererVulkan::DestroyOverlayTexture() {
         overlay_texture.image_view = nullptr;
     }
     if (overlay_texture.image) {
-        vmaDestroyImage(instance.GetAllocator(), overlay_texture.image,
-                        overlay_texture.allocation);
+        vmaDestroyImage(instance.GetAllocator(), overlay_texture.image, overlay_texture.allocation);
         overlay_texture.image = nullptr;
     }
 }
@@ -979,8 +991,8 @@ void RendererVulkan::UpdateOverlayTexture() {
         VkImage unsafe_image{};
         const VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
         const VkResult result =
-            vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                           &unsafe_image, &overlay_texture.allocation, nullptr);
+            vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info, &unsafe_image,
+                           &overlay_texture.allocation, nullptr);
         if (result != VK_SUCCESS) [[unlikely]] {
             LOG_CRITICAL(Render_Vulkan, "Failed allocating the overlay image with error {}",
                          result);
@@ -1082,7 +1094,8 @@ void RendererVulkan::UpdateOverlayTexture() {
 
 void RendererVulkan::DrawOverlayQuad(const Settings::OverlayQuad& quad) {
     const float u0 = quad.source_x / static_cast<float>(overlay_texture.width);
-    const float u1 = (quad.source_x + quad.source_width) / static_cast<float>(overlay_texture.width);
+    const float u1 =
+        (quad.source_x + quad.source_width) / static_cast<float>(overlay_texture.width);
     const float v0 = quad.source_y / static_cast<float>(overlay_texture.height);
     const float v1 =
         (quad.source_y + quad.source_height) / static_cast<float>(overlay_texture.height);
@@ -1147,8 +1160,8 @@ void RendererVulkan::DrawScreenPiece(u32 screen_id, const Settings::ScreenPiece&
                         static_cast<f32>(screen_info.texture.height * scale_factor),
                         1.0f / static_cast<f32>(screen_info.texture.width * scale_factor),
                         1.0f / static_cast<f32>(screen_info.texture.height * scale_factor));
-    draw_info.o_resolution = Common::MakeVec(piece.height, piece.width, 1.0f / piece.height,
-                                             1.0f / piece.width);
+    draw_info.o_resolution =
+        Common::MakeVec(piece.height, piece.width, 1.0f / piece.height, 1.0f / piece.width);
     draw_info.screen_id_l = screen_id;
 
     scheduler.Record([this, offset = offset, info = draw_info](vk::CommandBuffer cmdbuf) {

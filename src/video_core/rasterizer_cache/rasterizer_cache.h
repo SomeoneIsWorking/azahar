@@ -309,10 +309,8 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
 }
 
 template <class T>
-bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
-    const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
-                           "RasterizerCache::AccelerateDisplayTransfer ({})", config.DebugName()};
-
+auto RasterizerCache<T>::PlanDisplayTransfer(const Pica::DisplayTransferConfig& config)
+    -> std::optional<DisplayTransferPlan> {
     SurfaceParams src_params;
     src_params.addr = config.GetPhysicalInputAddress();
     src_params.width = config.output_width;
@@ -339,22 +337,20 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
                            Pica::BytesPerPixel(config.output_format);
     }
 
-    auto [src_surface_id, src_rect] = GetSurfaceSubRect(src_params, ScaleMatch::Ignore, true);
+    const auto [src_surface_id, src_rect] = GetSurfaceSubRect(src_params, ScaleMatch::Ignore, true);
     if (!src_surface_id) {
-        return false;
+        return std::nullopt;
     }
-
     dst_params.res_scale = slot_surfaces[src_surface_id].res_scale;
+    return DisplayTransferPlan{src_surface_id, src_rect, src_params, dst_params};
+}
 
-    const auto [dst_surface_id, dst_rect] =
-        GetSurfaceSubRect(dst_params, ScaleMatch::Upscale, false);
-    if (!dst_surface_id) {
-        return false;
-    }
-
-    Surface& src_surface = slot_surfaces[src_surface_id];
-    Surface& dst_surface = slot_surfaces[dst_surface_id];
-
+template <class T>
+bool RasterizerCache<T>::BlitDisplayTransfer(const Pica::DisplayTransferConfig& config,
+                                             const DisplayTransferPlan& plan, Surface& dst_surface,
+                                             Common::Rectangle<u32> dst_rect, u32 dst_level) {
+    Surface& src_surface = slot_surfaces[plan.src_surface_id];
+    Common::Rectangle<u32> src_rect = plan.src_rect;
     if (src_surface.is_tiled != dst_surface.is_tiled) {
         std::swap(src_rect.top, src_rect.bottom);
     }
@@ -367,15 +363,51 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
     }
 
     const TextureBlit texture_blit = {
-        .src_level = src_surface.LevelOf(src_params.addr),
-        .dst_level = dst_surface.LevelOf(dst_params.addr),
+        .src_level = src_surface.LevelOf(plan.src_params.addr),
+        .dst_level = dst_level,
         .src_rect = src_rect,
         .dst_rect = dst_rect,
     };
     runtime.BlitTextures(src_surface, dst_surface, texture_blit);
-
-    InvalidateRegion(dst_params.addr, dst_params.size, dst_surface_id);
     return true;
+}
+
+template <class T>
+bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
+                           "RasterizerCache::AccelerateDisplayTransfer ({})", config.DebugName()};
+    const std::optional<DisplayTransferPlan> plan = PlanDisplayTransfer(config);
+    if (!plan) {
+        return false;
+    }
+    const auto [dst_surface_id, dst_rect] =
+        GetSurfaceSubRect(plan->dst_params, ScaleMatch::Upscale, false);
+    if (!dst_surface_id) {
+        return false;
+    }
+    Surface& dst_surface = slot_surfaces[dst_surface_id];
+    if (!BlitDisplayTransfer(config, *plan, dst_surface, dst_rect,
+                             dst_surface.LevelOf(plan->dst_params.addr))) {
+        return false;
+    }
+    InvalidateRegion(plan->dst_params.addr, plan->dst_params.size, dst_surface_id);
+    return true;
+}
+
+template <class T>
+bool RasterizerCache<T>::DisplayTransferInto(const Pica::DisplayTransferConfig& config,
+                                             std::optional<Surface>& target) {
+    const std::optional<DisplayTransferPlan> plan = PlanDisplayTransfer(config);
+    if (!plan) {
+        return false;
+    }
+    const SurfaceParams& want = plan->dst_params;
+    if (!target || target->width != want.width || target->height != want.height ||
+        target->res_scale != want.res_scale || target->pixel_format != want.pixel_format) {
+        target.reset();
+        target.emplace(runtime, want);
+    }
+    return BlitDisplayTransfer(config, *plan, *target, target->GetScaledRect(), 0);
 }
 
 template <class T>

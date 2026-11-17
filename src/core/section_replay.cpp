@@ -19,25 +19,30 @@
 namespace Core {
 namespace {
 
-// ARM B or BL, always executed.
+constexpr u32 ArbitrateAddress = 0x22;
+
+// ARM B, BL or BLX register, always executed.
 struct Branch {
     VAddr target;
     bool link;
+    // BLX: the register holding the target.
+    std::optional<u32> reg;
 };
 
 std::optional<Branch> DecodeBranch(VAddr address, u32 instruction) {
+    if ((instruction & 0xFFFFFFF0) == 0xE12FFF30) {
+        return Branch{0, true, instruction & 0xF};
+    }
     if ((instruction & 0xFE000000) != 0xEA000000) {
         return std::nullopt;
     }
     const s32 offset = static_cast<s32>(instruction << 8) >> 6;
-    return Branch{static_cast<VAddr>(address + 8 + offset), (instruction & 0x01000000) != 0};
+    return Branch{static_cast<VAddr>(address + 8 + offset), (instruction & 0x01000000) != 0, {}};
 }
 
 } // namespace
 
-SectionReplay::SectionReplay(System& system_) : system(system_) {
-    hooks[ReturnAddress] = Hook::Return;
-}
+SectionReplay::SectionReplay(System& system_) : system(system_) {}
 
 SectionReplay::~SectionReplay() {
     if (section) {
@@ -55,32 +60,38 @@ void SectionReplay::Reset() {
     replaying = false;
 }
 
-bool SectionReplay::Install(VAddr call_site_, Handler handler_) {
-    const std::optional<Branch> branch =
-        DecodeBranch(call_site_, system.Memory().Read32(call_site_));
-    if (!branch) {
-        LOG_ERROR(Core, "section call site {:08X} is not an ARM B or BL", call_site_);
-        return false;
+bool SectionReplay::Install(VAddr open_site_, VAddr close_site_, Handler handler_) {
+    for (const VAddr site : {open_site_, close_site_}) {
+        if (!DecodeBranch(site, system.Memory().Read32(site))) {
+            LOG_ERROR(Core, "section site {:08X} is not an ARM B, BL or BLX", site);
+            return false;
+        }
     }
     Uninstall();
-    call_site = call_site_;
+    open_site = open_site_;
+    close_site = close_site_;
     handler = std::move(handler_);
-    hooks[call_site] = Hook::CallSite;
+    hooks[open_site] = Hook::Open;
+    hooks[close_site] = Hook::Close;
     for (u32 core = 0; core < system.GetNumCores(); ++core) {
-        system.GetCore(core).InvalidateCacheRange(call_site, 4);
+        system.GetCore(core).InvalidateCacheRange(open_site, 4);
+        system.GetCore(core).InvalidateCacheRange(close_site, 4);
     }
     return true;
 }
 
 void SectionReplay::Uninstall() {
-    if (call_site == 0) {
+    if (open_site == 0) {
         return;
     }
-    hooks.erase(call_site);
+    hooks.erase(open_site);
+    hooks.erase(close_site);
     for (u32 core = 0; core < system.GetNumCores(); ++core) {
-        system.GetCore(core).InvalidateCacheRange(call_site, 4);
+        system.GetCore(core).InvalidateCacheRange(open_site, 4);
+        system.GetCore(core).InvalidateCacheRange(close_site, 4);
     }
-    call_site = 0;
+    open_site = 0;
+    close_site = 0;
     handler = nullptr;
 }
 
@@ -96,7 +107,12 @@ SectionReplay::Svc SectionReplay::DescribeSvc(ARM_Interface& cpu, const Kernel::
                                               u32 immediate) {
     constexpr u32 SendSyncRequest = 0x32;
     constexpr VAddr CommandBuffer = 0x80;
-    Svc svc{immediate, cpu.GetPC() - 4, {}, 0};
+    Svc svc{immediate, cpu.GetPC() - 4, {}, 0, 0};
+    if (immediate == ArbitrateAddress) {
+        svc.address = cpu.GetReg(1);
+        svc.detail = cpu.GetReg(2);
+        return svc;
+    }
     if (immediate != SendSyncRequest) {
         return svc;
     }
@@ -105,22 +121,17 @@ SectionReplay::Svc SectionReplay::DescribeSvc(ARM_Interface& cpu, const Kernel::
     if (session) {
         svc.service = session->GetName();
     }
-    svc.header = system.Memory().Read32(thread.GetTLSAddress() + CommandBuffer);
+    svc.detail = system.Memory().Read32(thread.GetTLSAddress() + CommandBuffer);
     return svc;
 }
 
 bool SectionReplay::OnSvc(ARM_Interface& cpu, u32 immediate) {
     if (immediate >= HookSvcBase) {
-        switch (static_cast<Hook>(immediate - HookSvcBase)) {
-        case Hook::CallSite:
-            OpenWindow(cpu);
-            break;
-        case Hook::Return:
-            if (replaying) {
-                Stop(cpu, {});
-            } else {
-                CloseWindow(cpu);
-            }
+        const Hook hook = static_cast<Hook>(immediate - HookSvcBase);
+        switch (hook) {
+        case Hook::Open:
+        case Hook::Close:
+            AtSite(cpu, hook);
             break;
         default:
             UNREACHABLE_MSG("hook svc {:06X}", immediate);
@@ -128,17 +139,31 @@ bool SectionReplay::OnSvc(ARM_Interface& cpu, u32 immediate) {
         return true;
     }
     if (replaying) {
+        // ArbitrateAddress(handle, address, Signal, count): it wakes threads the replay does not
+        // run, so it does nothing.
+        constexpr u32 Signal = 0;
+        if (immediate == ArbitrateAddress && cpu.GetReg(2) == Signal) {
+            cpu.SetReg(0, 0);
+            return true;
+        }
         Stop(cpu, fmt::format("svc 0x{:02X} at {:08X}", immediate, cpu.GetPC() - 4));
         return true;
     }
-    if (window_open && &cpu == window_cpu) {
-        const Kernel::Thread* thread =
-            system.Kernel().GetThreadManager(cpu.GetID()).GetCurrentThread();
-        if (thread != nullptr && thread->GetThreadId() == window_thread) {
-            census.svcs.push_back(DescribeSvc(cpu, *thread, immediate));
-        }
+    const Kernel::Thread* thread = system.Kernel().GetThreadManager(cpu.GetID()).GetCurrentThread();
+    if (window_open && thread != nullptr) {
+        Svc svc = DescribeSvc(cpu, *thread, immediate);
+        svc.other_thread = !OnWindowThread(cpu);
+        census.svcs.push_back(std::move(svc));
     }
     return false;
+}
+
+bool SectionReplay::OnWindowThread(ARM_Interface& cpu) const {
+    if (&cpu != window_cpu) {
+        return false;
+    }
+    const Kernel::Thread* thread = system.Kernel().GetThreadManager(cpu.GetID()).GetCurrentThread();
+    return thread != nullptr && thread->GetThreadId() == window_thread;
 }
 
 void SectionReplay::OnException(ARM_Interface& cpu, VAddr pc) {
@@ -147,41 +172,49 @@ void SectionReplay::OnException(ARM_Interface& cpu, VAddr pc) {
     }
 }
 
-void SectionReplay::OpenWindow(ARM_Interface& cpu) {
+void SectionReplay::AtSite(ARM_Interface& cpu, Hook hook) {
     // The hook stands in for the branch; dynarmic has already moved the PC past it.
     const VAddr site = cpu.GetPC() - 4;
     const std::optional<Branch> branch = DecodeBranch(site, system.Memory().Read32(site));
     ASSERT(branch);
+    const VAddr target = branch->reg ? cpu.GetReg(*branch->reg) : branch->target;
+    ASSERT_MSG((target & 1) == 0, "section site {:08X} branches to Thumb", site);
     if (branch->link) {
         cpu.SetReg(14, site + 4);
     }
-    cpu.SetPC(branch->target);
-    if (window_open || replaying || handler == nullptr) {
-        return;
+    cpu.SetPC(target);
+    if (hook == Hook::Close) {
+        if (replaying) {
+            Stop(cpu, {});
+        } else if (window_open && OnWindowThread(cpu)) {
+            CloseWindow(cpu);
+        }
+    } else if (!window_open && !replaying && OpenWindow(cpu)) {
+        cpu.SaveContext(start_context);
+    }
+}
+
+bool SectionReplay::OpenWindow(ARM_Interface& cpu) {
+    if (handler == nullptr) {
+        return false;
     }
     const auto process = system.Kernel().GetCurrentProcess();
     const Kernel::Thread* thread = system.Kernel().GetThreadManager(cpu.GetID()).GetCurrentThread();
     if (process == nullptr || thread == nullptr) {
-        return;
+        return false;
     }
-    cpu.SaveContext(start_context);
-    target = branch->target;
-    return_address = cpu.GetReg(14);
     census = {};
     window_thread = thread->GetThreadId();
     window_cpu = &cpu;
     section->Clear();
     section->Arm(*process);
     SetJournal(section.get());
-    cpu.SetReg(14, ReturnAddress);
     window_open = true;
     opened = std::chrono::steady_clock::now();
+    return true;
 }
 
 void SectionReplay::CloseWindow(ARM_Interface& cpu) {
-    ASSERT_MSG(window_open, "the section returned without an open window");
-    cpu.SetPC(return_address);
-    cpu.SetReg(14, return_address);
     section->Disarm();
     SetJournal(nullptr);
     census.pages = section->Pages().size();
@@ -214,7 +247,8 @@ void SectionReplay::Stop(ARM_Interface& cpu, std::string why) {
 void SectionReplay::CountTicks(u64 ticks) {
     replay_ticks += ticks;
     if (replay_ticks > ReplayTickLimit && !stopped && window_cpu != nullptr) {
-        Stop(*window_cpu, "tick limit");
+        Stop(*window_cpu, fmt::format("tick limit at {:08X} lr {:08X}", window_cpu->GetPC(),
+                                      window_cpu->GetReg(14)));
     }
 }
 
@@ -244,8 +278,6 @@ SectionReplay::Result SectionReplay::Replay(std::span<const Input> inputs,
     }
 
     cpu.LoadContext(start_context);
-    cpu.SetReg(14, ReturnAddress);
-    cpu.SetPC(target);
     cpu.ClearExclusiveState();
     replaying = true;
     stopped = false;
@@ -256,16 +288,17 @@ SectionReplay::Result SectionReplay::Replay(std::span<const Input> inputs,
     }
     replaying = false;
 
-    replay->Disarm();
-    SetJournal(nullptr);
     result.instructions = replay_ticks;
-    result.pages = replay->Pages().size();
-    result.held_reads = replay->HeldReads();
     result.refusal = refusal;
     result.done = refusal.empty();
+    // The capture's own stores are journalled with the replay's.
     if (result.done && capture) {
         capture();
     }
+    replay->Disarm();
+    SetJournal(nullptr);
+    result.pages = replay->Pages().size();
+    result.held_reads = replay->HeldReads();
     replay->Rollback();
     section->Exchange();
     cpu.LoadContext(end_context);

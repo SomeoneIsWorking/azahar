@@ -59,6 +59,12 @@ public:
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
     bool AccelerateDisplay(const Pica::FramebufferConfig& config, PAddr framebuffer_addr,
                            u32 pixel_stride, ScreenInfo& screen_info);
+    bool MakeInBetween(const Pica::DisplayTransferConfig& config, u32 screen,
+                       PAddr shown_at) override;
+    /// Puts screen `screen`'s in-between into `screen_info` on a vblank that shows
+    /// `framebuffer_addr` again, until the frame it leads to shows
+    bool TakeInBetween(u32 screen, PAddr framebuffer_addr, bool first_show,
+                       ScreenInfo& screen_info);
     bool AccelerateDrawBatch(bool is_indexed) override;
 
     /// Switches the disk resources to the specified title
@@ -121,6 +127,12 @@ private:
     PipelineCache pipeline_cache;
     TextureRuntime runtime;
     RasterizerCache res_cache;
+    struct InBetween {
+        std::optional<Surface> image;
+        PAddr shown_at = 0;
+        bool due = false;
+    };
+    std::array<InBetween, 2> in_betweens;
 
     VertexLayout software_layout;
     std::array<u32, 16> binding_offsets{};

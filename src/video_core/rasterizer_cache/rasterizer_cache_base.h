@@ -90,6 +90,11 @@ public:
     /// Perform hardware accelerated display transfer according to the provided configuration
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config);
 
+    /// Perform a display transfer into `target`, a surface the cache does not track, made to match
+    /// the transfer's output; the guest's output memory is left alone
+    bool DisplayTransferInto(const Pica::DisplayTransferConfig& config,
+                             std::optional<Surface>& target);
+
     /// Perform hardware accelerated memory fill according to the provided configuration
     bool AccelerateFill(const Pica::MemoryFillConfig& config);
 
@@ -139,6 +144,19 @@ public:
     void ClearAll(bool flush);
 
 private:
+    /// A display transfer's source and the parameters of its output
+    struct DisplayTransferPlan {
+        SurfaceId src_surface_id;
+        Common::Rectangle<u32> src_rect;
+        SurfaceParams src_params;
+        SurfaceParams dst_params;
+    };
+    std::optional<DisplayTransferPlan> PlanDisplayTransfer(
+        const Pica::DisplayTransferConfig& config);
+    bool BlitDisplayTransfer(const Pica::DisplayTransferConfig& config,
+                             const DisplayTransferPlan& plan, Surface& dst_surface,
+                             Common::Rectangle<u32> dst_rect, u32 dst_level);
+
     /// Iterate over all page indices in a range
     template <typename Func>
     void ForEachPage(PAddr addr, std::size_t size, Func&& func) {

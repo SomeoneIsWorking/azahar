@@ -834,6 +834,28 @@ bool RasterizerVulkan::AccelerateDisplay(const Pica::FramebufferConfig& config,
     return true;
 }
 
+bool RasterizerVulkan::MakeInBetween(const Pica::DisplayTransferConfig& config, u32 screen,
+                                     PAddr shown_at) {
+    InBetween& in_between = in_betweens.at(screen);
+    in_between.due = res_cache.DisplayTransferInto(config, in_between.image);
+    in_between.shown_at = shown_at;
+    return in_between.due;
+}
+
+bool RasterizerVulkan::TakeInBetween(u32 screen, PAddr framebuffer_addr, bool first_show,
+                                     ScreenInfo& screen_info) {
+    InBetween& in_between = in_betweens.at(screen);
+    if (in_between.due && in_between.shown_at == framebuffer_addr) {
+        in_between.due = false;
+    }
+    if (!in_between.due || first_show) {
+        return false;
+    }
+    screen_info.texcoords = Common::Rectangle<f32>(0.f, 0.f, 1.f, 1.f);
+    screen_info.image_view = in_between.image->ImageView();
+    return true;
+}
+
 void RasterizerVulkan::MakeSoftwareVertexLayout() {
     constexpr std::array sizes = {4, 4, 2, 2, 2, 1, 4, 3};
 

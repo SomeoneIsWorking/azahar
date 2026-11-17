@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <memory>
+#include <span>
 #include <boost/serialization/access.hpp>
 
 #include "core/hle/service/gsp/gsp_interrupt.h"
@@ -63,6 +64,12 @@ public:
     /// Executes the provided GSP command.
     void Execute(const Service::GSP::Command& command);
 
+    /// Runs GSP commands beside the game's own: no interrupts are signalled, the PICA state is put
+    /// back afterwards, and a display transfer to a screen's framebuffer makes that screen's
+    /// in-between image (RasterizerInterface::MakeInBetween) instead of writing guest memory.
+    /// Returns the number of in-betweens made.
+    u32 RunDetached(std::span<const Service::GSP::Command> commands);
+
     /// Updates GPU display framebuffer configuration using the specified parameters.
     void SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
 
@@ -108,6 +115,9 @@ private:
     void MemoryTransfer();
 
     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
+
+    /// Makes the renderer upload all of the PICA state again.
+    void MarkPicaStateDirty();
 
     friend class boost::serialization::access;
     template <class Archive>

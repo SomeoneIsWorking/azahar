@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <sstream>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -254,6 +255,59 @@ void GPU::Execute(const Service::GSP::Command& command) {
     if (impl->debug_context) {
         impl->debug_context->OnEvent(Pica::DebugContext::Event::GSPCommandProcessed, &command);
     }
+}
+
+u32 GPU::RunDetached(std::span<const Service::GSP::Command> commands) {
+    using Service::GSP::CommandId;
+    std::stringstream saved;
+    {
+        oarchive archive{saved};
+        archive & impl->pica;
+    }
+    Service::GSP::InterruptHandler signal = std::move(impl->signal_interrupt);
+    Service::GSP::InterruptHandler none = [](Service::GSP::InterruptId, u64) {};
+    impl->signal_interrupt = none;
+    impl->pica.SetInterruptHandler(none);
+
+    u32 made = 0;
+    for (const Service::GSP::Command& command : commands) {
+        switch (command.id) {
+        case CommandId::SubmitCmdList:
+            impl->pica.ProcessCmdList(VirtualToPhysicalAddress(command.submit_gpu_cmdlist.address),
+                                      command.submit_gpu_cmdlist.size, false);
+            break;
+        case CommandId::DisplayTransfer: {
+            const auto& params = command.display_transfer;
+            auto& config = impl->pica.regs.display_transfer_config;
+            config.input_address = VirtualToPhysicalAddress(params.in_buffer_address) >> 3;
+            config.output_address = VirtualToPhysicalAddress(params.out_buffer_address) >> 3;
+            config.input_size = params.in_buffer_size;
+            config.output_size = params.out_buffer_size;
+            config.flags = params.flags;
+            const PAddr output = config.GetPhysicalOutputAddress();
+            for (u32 screen = 0; screen < 2; ++screen) {
+                const auto& framebuffer = impl->pica.regs.framebuffer_config[screen];
+                if ((output == framebuffer.address_left1 || output == framebuffer.address_left2) &&
+                    impl->rasterizer->MakeInBetween(config, screen, output)) {
+                    ++made;
+                }
+            }
+            break;
+        }
+        default:
+            Execute(command);
+            break;
+        }
+    }
+
+    impl->signal_interrupt = std::move(signal);
+    impl->pica.SetInterruptHandler(impl->signal_interrupt);
+    {
+        iarchive archive{saved};
+        archive & impl->pica;
+    }
+    MarkPicaStateDirty();
+    return made;
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
@@ -520,6 +574,10 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
         impl->renderer->Rasterizer()->LoadDefaultDiskResources(false, nullptr);
     }
 
+    MarkPicaStateDirty();
+}
+
+void GPU::MarkPicaStateDirty() {
     // Mark ALL GPU registers as dirty so current state gets uploaded to new renderer
     impl->pica.dirty_regs.SetAllDirty();
 
