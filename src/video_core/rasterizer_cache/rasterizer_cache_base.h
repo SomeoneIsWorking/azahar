@@ -6,8 +6,10 @@
 
 #include <functional>
 #include <list>
+#include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <boost/icl/interval_map.hpp>
@@ -15,6 +17,7 @@
 
 #include "video_core/rasterizer_cache/framebuffer_base.h"
 #include "video_core/rasterizer_cache/sampler_params.h"
+#include "video_core/rasterizer_cache/surface_base.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/texture_cube.h"
 
@@ -140,6 +143,17 @@ public:
     /// Flush all cached resources tracked by this cache manager
     void FlushAll();
 
+    /// Opens the overlay a replay runs in: until CloseOverlay, the first image write to a surface
+    /// that existed at the open goes to a copy that takes its slot. Closing puts the surfaces,
+    /// their registration, the dirty regions and the texture cubes back as they were at the open,
+    /// and retires every surface made meanwhile.
+    void OpenOverlay();
+    void CloseOverlay();
+
+    /// The registered surfaces with their contents' hashes, the dirty regions, the cached pages
+    /// and the texture cubes, read back for a leak check
+    std::map<std::string, std::string> CaptureState();
+
     /// Clear all cached resources tracked by this cache manager
     void ClearAll(bool flush);
 
@@ -185,8 +199,13 @@ private:
     /// Unregisters sentenced surfaces that have surpassed the destruction threshold.
     void RunGarbageCollector();
 
-    /// Removes any framebuffers that reference the provided surface_id.
+    /// Removes any framebuffers that reference the provided surface_id; their objects are
+    /// destroyed once the GPU is done with them.
     void RemoveFramebuffers(SurfaceId surface_id);
+
+    /// Before an image write to surface_id: a surface the open overlay keeps is copied into a new
+    /// slot first and the copy takes its place, so the write lands on the copy.
+    void PrepareWrite(SurfaceId surface_id);
 
     /// Removes any references of the provided surface id from cached texture cubes.
     void RemoveTextureCubeFace(SurfaceId surface_id);
@@ -242,6 +261,19 @@ private:
     std::unordered_map<FramebufferParams, FramebufferId> framebuffers;
     std::unordered_map<SamplerParams, SamplerId> samplers;
     std::list<std::pair<SurfaceId, u64>> sentenced;
+    std::list<std::pair<FramebufferId, u64>> sentenced_framebuffers;
+    /// What an open overlay puts back on close.
+    struct Overlay {
+        /// The metadata of the surfaces registered or in a texture cube at the open, by slot.
+        std::unordered_map<u32, SurfaceBase> kept;
+        /// The kept surfaces written meanwhile: the slot that holds the original, by slot.
+        std::unordered_map<u32, SurfaceId> originals;
+        /// The kept surfaces unregistered meanwhile.
+        std::vector<SurfaceId> unregistered;
+        SurfaceMap dirty_regions;
+        std::unordered_map<TextureCubeConfig, TextureCube> texture_cube_cache;
+    };
+    std::optional<Overlay> overlay;
     Common::SlotVector<Surface> slot_surfaces;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;

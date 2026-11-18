@@ -61,15 +61,11 @@ bool StoreJournal::Holds(const PageTable& page_table, std::size_t page_index) co
 }
 
 void StoreJournal::Touch(PageTable& page_table, std::size_t page_index, u8* host_page) {
-    if (host_page != nullptr && !saved.contains(host_page)) {
-        auto bytes = std::make_unique<std::array<u8, CITRA_PAGE_SIZE>>();
-        std::memcpy(bytes->data(), host_page, CITRA_PAGE_SIZE);
-        saved.emplace(host_page, pages.size());
+    if (host_page != nullptr) {
         const bool cached =
             page_table.attributes[page_index] == PageType::RasterizerCachedMemory ||
             page_table.attributes[page_index] == PageType::RasterizerCachedMemoryWatchpoint;
-        pages.push_back({host_page, static_cast<VAddr>(page_index << CITRA_PAGE_BITS), cached,
-                         std::move(bytes)});
+        SavePage(host_page, static_cast<VAddr>(page_index << CITRA_PAGE_BITS), cached);
     }
     if (Holds(page_table, page_index)) {
         held[page_index] = false;
@@ -77,6 +73,20 @@ void StoreJournal::Touch(PageTable& page_table, std::size_t page_index, u8* host
             page_table.GetPointerArray()[page_index] = page_table.pointers.Backing(page_index);
         }
     }
+}
+
+void StoreJournal::Save(u8* host_page, VAddr vaddr) {
+    SavePage(host_page, vaddr, true);
+}
+
+void StoreJournal::SavePage(u8* host_page, VAddr vaddr, bool cached) {
+    if (saved.contains(host_page)) {
+        return;
+    }
+    auto bytes = std::make_unique<std::array<u8, CITRA_PAGE_SIZE>>();
+    std::memcpy(bytes->data(), host_page, CITRA_PAGE_SIZE);
+    saved.emplace(host_page, pages.size());
+    pages.push_back({host_page, vaddr, cached, std::move(bytes)});
 }
 
 void StoreJournal::Rollback() {

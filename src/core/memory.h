@@ -721,6 +721,9 @@ public:
     /// Every store through this memory system saves its page in the journal first; null for none.
     void SetStoreJournal(StoreJournal* journal);
 
+    /// Before the GPU writes physical memory: the journal, while one is set, saves the pages.
+    void JournalPhysicalStore(PAddr address, u32 size);
+
 private:
     template <typename T>
     void UnmappedAccess(const VAddr vaddr, const T value, bool read);

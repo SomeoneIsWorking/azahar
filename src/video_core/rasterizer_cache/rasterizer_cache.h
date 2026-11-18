@@ -4,10 +4,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
+#include <fmt/format.h>
 #include "common/alignment.h"
+#include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -166,6 +169,14 @@ void RasterizerCache<T>::RunGarbageCollector() {
         slot_surfaces.erase(surface_id);
         it = sentenced.erase(it);
     }
+    for (auto it = sentenced_framebuffers.begin(); it != sentenced_framebuffers.end();) {
+        if (resource_free_tick <= it->second) {
+            it++;
+            continue;
+        }
+        slot_framebuffers.erase(it->first);
+        it = sentenced_framebuffers.erase(it);
+    }
 }
 
 template <class T>
@@ -173,7 +184,7 @@ void RasterizerCache<T>::RemoveFramebuffers(SurfaceId surface_id) {
     for (auto it = framebuffers.begin(); it != framebuffers.end();) {
         const auto& params = it->first;
         if (params.color_id == surface_id || params.depth_id == surface_id) {
-            slot_framebuffers.erase(it->second);
+            sentenced_framebuffers.emplace_back(it->second, runtime.GetResourceTick());
             it = framebuffers.erase(it);
         } else {
             it++;
@@ -278,6 +289,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     if (!dst_surface_id) {
         return false;
     }
+    PrepareWrite(dst_surface_id);
 
     Surface& src_surface = slot_surfaces[src_surface_id];
     Surface& dst_surface = slot_surfaces[dst_surface_id];
@@ -385,6 +397,7 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
     if (!dst_surface_id) {
         return false;
     }
+    PrepareWrite(dst_surface_id);
     Surface& dst_surface = slot_surfaces[dst_surface_id];
     if (!BlitDisplayTransfer(config, *plan, dst_surface, dst_rect,
                              dst_surface.LevelOf(plan->dst_params.addr))) {
@@ -733,16 +746,17 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
         cube.surface_id = CreateSurface(cube_params);
     }
 
-    Surface& cube_surface = slot_surfaces[cube.surface_id];
     for (u32 i = 0; i < addresses.size(); i++) {
         const SurfaceId& face_id = cube.face_ids[i];
         if (!addresses[i] || !face_id) {
             continue;
         }
-        Surface& surface = slot_surfaces[face_id];
-        if (cube.ticks[i] == surface.modification_tick) {
+        if (cube.ticks[i] == slot_surfaces[face_id].modification_tick) {
             continue;
         }
+        PrepareWrite(cube.surface_id);
+        Surface& cube_surface = slot_surfaces[cube.surface_id];
+        Surface& surface = slot_surfaces[face_id];
         cube.ticks[i] = surface.modification_tick;
         boost::container::small_vector<TextureCopy, 8> upload_copies;
         for (u32 level = 0; level < config.levels; level++) {
@@ -824,6 +838,8 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         fb_rect = depth_rect;
     }
 
+    PrepareWrite(color_id);
+    PrepareWrite(depth_id);
     Surface* color_surface = color_id ? &slot_surfaces[color_id] : nullptr;
     Surface* depth_surface = depth_id ? &slot_surfaces[depth_id] : nullptr;
 
@@ -1030,11 +1046,11 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         return;
     }
 
-    SurfaceRegions validate_regions = slot_surfaces[surface_id].invalid_regions & validate_interval;
-
-    if (validate_regions.empty()) {
+    if ((slot_surfaces[surface_id].invalid_regions & validate_interval).empty()) {
         return;
     }
+    PrepareWrite(surface_id);
+    SurfaceRegions validate_regions = slot_surfaces[surface_id].invalid_regions & validate_interval;
 
     auto notify_validated = [&](SurfaceInterval interval) {
         slot_surfaces[surface_id].MarkValid(interval);
@@ -1190,6 +1206,10 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
         }
         return true;
     };
+    // A decode finishing after the overlay closes would upload into the surface it put back.
+    if (overlay) {
+        return material->IsDecoded() && upload();
+    }
     return custom_tex_manager.Decode(material, std::move(upload));
 }
 
@@ -1218,6 +1238,7 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
         return;
     }
 
+    memory.JournalPhysicalStore(flush_start, flush_end - flush_start);
     const auto download_dest = dest_ptr.GetWriteBytes(flush_end - flush_start);
     EncodeTexture(flush_info, flush_start, flush_end, staging.mapped, download_dest,
                   runtime.NeedsConversion(surface));
@@ -1240,6 +1261,8 @@ void RasterizerCache<T>::DownloadFillSurface(Surface& surface, SurfaceInterval i
     const u32 coarse_start_offset = start_offset - (start_offset % surface.fill_size);
     const u32 backup_bytes = start_offset % surface.fill_size;
 
+    memory.JournalPhysicalStore(surface.addr + coarse_start_offset,
+                                end_offset - coarse_start_offset);
     std::array<u8, 4> backup_data;
     if (backup_bytes) {
         std::memcpy(backup_data.data(), &dest_ptr[coarse_start_offset], backup_bytes);
@@ -1374,6 +1397,182 @@ void RasterizerCache<T>::FlushAll() {
 }
 
 template <class T>
+std::map<std::string, std::string> RasterizerCache<T>::CaptureState() {
+    std::map<std::string, std::string> state;
+    std::vector<SurfaceId> registered;
+    for (const auto& [page, surfaces] : page_table) {
+        registered.insert(registered.end(), surfaces.begin(), surfaces.end());
+    }
+    std::ranges::sort(registered);
+    registered.erase(std::unique(registered.begin(), registered.end()), registered.end());
+    constexpr auto kept_flags = SurfaceFlagBits::Registered | SurfaceFlagBits::Tracked |
+                                SurfaceFlagBits::Custom | SurfaceFlagBits::ShadowSource |
+                                SurfaceFlagBits::RenderTarget;
+    for (const SurfaceId surface_id : registered) {
+        Surface& surface = slot_surfaces[surface_id];
+        std::string invalid;
+        for (const auto& interval : surface.invalid_regions) {
+            invalid += fmt::format("{:x}-{:x},", interval.lower(), interval.upper());
+        }
+        u64 contents = 0;
+        if (surface.type == SurfaceType::Fill) {
+            contents = Common::ComputeHash64(surface.fill_data.data(), surface.fill_size);
+        } else if (!surface.IsCustom()) {
+            // A depth-stencil download is packed to the guest's 4 bytes (DepthToBuffer).
+            const u32 pixel_bytes = surface.pixel_format == PixelFormat::D24S8
+                                        ? surface.GetFormatBpp() / 8
+                                        : surface.GetInternalBytesPerPixel();
+            const u32 bytes = surface.width * surface.height * pixel_bytes;
+            const auto staging = runtime.FindStaging(
+                surface.width * surface.height * surface.GetInternalBytesPerPixel(), false);
+            surface.Download(
+                BufferTextureCopy{
+                    .buffer_offset = staging.offset,
+                    .buffer_size = staging.size,
+                    .texture_rect = surface.GetRect(),
+                    .texture_level = 0,
+                },
+                staging);
+            contents = Common::ComputeHash64(staging.mapped.data(), bytes);
+        }
+        state.emplace(fmt::format("surface {}", surface_id.index),
+                      fmt::format("{:x}-{:x} format={} type={} {}x{} stride={} scale={} levels={} "
+                                  "flags={:x} invalid={} contents={:016x}",
+                                  surface.addr, surface.end, static_cast<u32>(surface.pixel_format),
+                                  static_cast<u32>(surface.type), surface.width, surface.height,
+                                  surface.stride, surface.res_scale, surface.levels,
+                                  static_cast<u32>(surface.flags & kept_flags), invalid, contents));
+    }
+    for (const auto& [interval, surface_id] : dirty_regions) {
+        state.emplace(fmt::format("dirty {:x}-{:x}", interval.lower(), interval.upper()),
+                      fmt::format("surface {}", surface_id.index));
+    }
+    for (const auto& [interval, count] : cached_pages) {
+        state.emplace(fmt::format("pages {:x}-{:x}", interval.lower(), interval.upper()),
+                      fmt::format("{}", count));
+    }
+    for (const auto& [config, cube] : texture_cube_cache) {
+        std::string faces;
+        for (const SurfaceId face_id : cube.face_ids) {
+            faces += fmt::format("{},", face_id.index);
+        }
+        state.emplace(fmt::format("cube {:016x}", config.Hash()),
+                      fmt::format("surface {} faces {}", cube.surface_id.index, faces));
+    }
+    return state;
+}
+
+template <class T>
+void RasterizerCache<T>::OpenOverlay() {
+    ASSERT_MSG(!overlay, "The rasterizer cache's overlay is already open");
+    Overlay& open = overlay.emplace();
+    open.dirty_regions = dirty_regions;
+    open.texture_cube_cache = texture_cube_cache;
+    for (const auto& [page, surfaces] : page_table) {
+        for (const SurfaceId surface_id : surfaces) {
+            open.kept.try_emplace(surface_id.index, slot_surfaces[surface_id]);
+        }
+    }
+    for (const auto& [config, cube] : texture_cube_cache) {
+        open.kept.try_emplace(cube.surface_id.index, slot_surfaces[cube.surface_id]);
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::PrepareWrite(SurfaceId surface_id) {
+    if (!overlay || !surface_id || !overlay->kept.contains(surface_id.index) ||
+        overlay->originals.contains(surface_id.index) ||
+        slot_surfaces[surface_id].type == SurfaceType::Fill) {
+        return;
+    }
+    const SurfaceBase original{slot_surfaces[surface_id]};
+    SurfaceParams params = original;
+    params.custom_format = CustomPixelFormat::Invalid;
+    const SurfaceId copy_id = CreateSurface(params);
+    Surface& copy = slot_surfaces[copy_id];
+    static_cast<SurfaceBase&>(copy) = original;
+    if (original.IsCustom()) {
+        // A custom image is not copied: the copy uploads what the replay reads.
+        copy.flags &= ~SurfaceFlagBits::Custom;
+        copy.material = nullptr;
+        copy.custom_format = CustomPixelFormat::Invalid;
+        copy.MarkInvalid(copy.GetInterval());
+    } else {
+        const u32 layers = original.texture_type == TextureType::CubeMap ? 6 : 1;
+        boost::container::small_vector<TextureCopy, 16> copies;
+        for (u32 level = 0; level < original.levels; level++) {
+            for (u32 layer = 0; layer < layers; layer++) {
+                copies.push_back({
+                    .src_level = level,
+                    .dst_level = level,
+                    .src_layer = layer,
+                    .dst_layer = layer,
+                    .src_offset = {0, 0},
+                    .dst_offset = {0, 0},
+                    .extent = {original.GetScaledWidth() >> level,
+                               original.GetScaledHeight() >> level},
+                });
+            }
+        }
+        runtime.CopyTextures(slot_surfaces[surface_id], copy, copies);
+    }
+    slot_surfaces.swap(surface_id, copy_id);
+    RemoveFramebuffers(surface_id);
+    overlay->originals.emplace(surface_id.index, copy_id);
+}
+
+template <class T>
+void RasterizerCache<T>::CloseOverlay() {
+    ASSERT_MSG(overlay, "The rasterizer cache's overlay is not open");
+    Overlay closing = std::move(*overlay);
+    overlay.reset();
+
+    std::vector<SurfaceId> made;
+    for (const auto& [page, surfaces] : page_table) {
+        for (const SurfaceId surface_id : surfaces) {
+            if (!closing.kept.contains(surface_id.index)) {
+                made.push_back(surface_id);
+            }
+        }
+    }
+    std::ranges::sort(made);
+    made.erase(std::unique(made.begin(), made.end()), made.end());
+    for (const SurfaceId surface_id : made) {
+        UnregisterSurface(surface_id);
+    }
+
+    for (const auto& [index, original_id] : closing.originals) {
+        const SurfaceId surface_id{index};
+        slot_surfaces.swap(surface_id, original_id);
+        RemoveFramebuffers(surface_id);
+        slot_surfaces[original_id].flags &=
+            ~(SurfaceFlagBits::Registered | SurfaceFlagBits::Tracked);
+        sentenced.emplace_back(original_id, runtime.GetResourceTick());
+    }
+    for (const SurfaceId surface_id : closing.unregistered) {
+        slot_surfaces[surface_id].flags &= ~SurfaceFlagBits::Registered;
+        RegisterSurface(surface_id);
+    }
+    for (const auto& [index, kept] : closing.kept) {
+        static_cast<SurfaceBase&>(slot_surfaces[SurfaceId{index}]) = kept;
+    }
+
+    const auto is_sentenced = [this](SurfaceId surface_id) {
+        return std::ranges::any_of(
+            sentenced, [surface_id](const auto& item) { return item.first == surface_id; });
+    };
+    for (const auto& [config, cube] : texture_cube_cache) {
+        if (!closing.texture_cube_cache.contains(config) && !is_sentenced(cube.surface_id)) {
+            sentenced.emplace_back(cube.surface_id, runtime.GetResourceTick());
+        }
+    }
+    texture_cube_cache = std::move(closing.texture_cube_cache);
+    sentenced.remove_if(
+        [&closing](const auto& item) { return closing.kept.contains(item.first.index); });
+    dirty_regions = std::move(closing.dirty_regions);
+}
+
+template <class T>
 void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region_owner_id) {
     if (size == 0) [[unlikely]] {
         return;
@@ -1488,6 +1687,11 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
         surfaces.erase(vector_it);
     });
 
+    // The overlay registers it again on close, so its slot, faces and contents stay.
+    if (overlay && overlay->kept.contains(surface_id.index)) {
+        overlay->unregistered.push_back(surface_id);
+        return;
+    }
     if (surface.type != SurfaceType::Fill) {
         RemoveTextureCubeFace(surface_id);
         sentenced.emplace_back(surface_id, runtime.GetResourceTick());

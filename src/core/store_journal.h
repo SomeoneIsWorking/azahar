@@ -44,6 +44,9 @@ public:
 
     // Saves the page behind page_index before its first store, and restores its pointer.
     void Touch(PageTable& page_table, std::size_t page_index, u8* host_page);
+    // Saves a page before a store that does not come from the CPU (the GPU writing physical
+    // memory); `vaddr` is where the process sees it, invalidated in the rasterizer on restore.
+    void Save(u8* host_page, VAddr vaddr);
 
     [[nodiscard]] const std::vector<Page>& Pages() const {
         return pages;
@@ -65,6 +68,8 @@ public:
     void Clear();
 
 private:
+    void SavePage(u8* host_page, VAddr vaddr, bool cached);
+
     MemorySystem& memory;
     PageTable* table = nullptr;
     std::vector<std::size_t> armed;

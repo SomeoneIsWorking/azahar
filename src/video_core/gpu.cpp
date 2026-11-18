@@ -257,7 +257,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
 }
 
-u32 GPU::RunDetached(std::span<const Service::GSP::Command> commands) {
+GPU::DetachedRun GPU::RunDetached(std::span<const Service::GSP::Command> commands) {
     using Service::GSP::CommandId;
     std::stringstream saved;
     {
@@ -269,13 +269,50 @@ u32 GPU::RunDetached(std::span<const Service::GSP::Command> commands) {
     impl->signal_interrupt = none;
     impl->pica.SetInterruptHandler(none);
 
-    u32 made = 0;
+    DetachedRun run;
+    const auto accelerated = [&run](bool done) {
+        if (!done) {
+            ++run.skipped;
+        }
+    };
     for (const Service::GSP::Command& command : commands) {
         switch (command.id) {
         case CommandId::SubmitCmdList:
             impl->pica.ProcessCmdList(VirtualToPhysicalAddress(command.submit_gpu_cmdlist.address),
                                       command.submit_gpu_cmdlist.size, false);
             break;
+        case CommandId::MemoryFill: {
+            const auto& params = command.memory_fill;
+            auto& memfill = impl->pica.regs.memory_fill_config;
+            const std::array<std::array<u32, 4>, 2> fills = {{
+                {params.start1, params.end1, params.value1, params.control1},
+                {params.start2, params.end2, params.value2, params.control2},
+            }};
+            for (u32 index = 0; index < fills.size(); ++index) {
+                const auto& [start, end, value, control] = fills[index];
+                if (start == 0) {
+                    continue;
+                }
+                memfill[index].address_start = VirtualToPhysicalAddress(start) >> 3;
+                memfill[index].address_end = VirtualToPhysicalAddress(end) >> 3;
+                memfill[index].value_32bit = value;
+                memfill[index].control = control;
+                accelerated(impl->rasterizer->AccelerateFill(memfill[index]));
+            }
+            break;
+        }
+        case CommandId::TextureCopy: {
+            const auto& params = command.texture_copy;
+            auto& config = impl->pica.regs.display_transfer_config;
+            config.input_address = VirtualToPhysicalAddress(params.in_buffer_address) >> 3;
+            config.output_address = VirtualToPhysicalAddress(params.out_buffer_address) >> 3;
+            config.texture_copy.size = params.size;
+            config.texture_copy.input_size = params.in_width_gap;
+            config.texture_copy.output_size = params.out_width_gap;
+            config.flags = params.flags;
+            accelerated(impl->rasterizer->AccelerateTextureCopy(config));
+            break;
+        }
         case CommandId::DisplayTransfer: {
             const auto& params = command.display_transfer;
             auto& config = impl->pica.regs.display_transfer_config;
@@ -285,12 +322,18 @@ u32 GPU::RunDetached(std::span<const Service::GSP::Command> commands) {
             config.output_size = params.out_buffer_size;
             config.flags = params.flags;
             const PAddr output = config.GetPhysicalOutputAddress();
-            for (u32 screen = 0; screen < 2; ++screen) {
-                const auto& framebuffer = impl->pica.regs.framebuffer_config[screen];
-                if ((output == framebuffer.address_left1 || output == framebuffer.address_left2) &&
-                    impl->rasterizer->MakeInBetween(config, screen, output)) {
-                    ++made;
+            bool screen = false;
+            for (u32 index = 0; index < 2; ++index) {
+                const auto& framebuffer = impl->pica.regs.framebuffer_config[index];
+                if (output == framebuffer.address_left1 || output == framebuffer.address_left2) {
+                    screen = true;
+                    if (impl->rasterizer->MakeInBetween(config, index, output)) {
+                        ++run.in_betweens;
+                    }
                 }
+            }
+            if (!screen) {
+                accelerated(impl->rasterizer->AccelerateDisplayTransfer(config));
             }
             break;
         }
@@ -307,7 +350,19 @@ u32 GPU::RunDetached(std::span<const Service::GSP::Command> commands) {
         archive & impl->pica;
     }
     MarkPicaStateDirty();
-    return made;
+    return run;
+}
+
+void GPU::OpenOverlay() {
+    impl->rasterizer->OpenOverlay();
+}
+
+void GPU::CloseOverlay() {
+    impl->rasterizer->CloseOverlay();
+}
+
+CacheState GPU::CaptureCacheState() {
+    return impl->rasterizer->CaptureCacheState();
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {

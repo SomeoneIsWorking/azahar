@@ -15,6 +15,7 @@
 #include "core/memory.h"
 #include "core/section_replay.h"
 #include "core/store_journal.h"
+#include "video_core/gpu.h"
 
 namespace Core {
 namespace {
@@ -295,6 +296,8 @@ SectionReplay::Result SectionReplay::Replay(std::span<const Input> inputs,
     ARM_Interface::ThreadContext end_context{};
     cpu.SaveContext(end_context);
 
+    // The cache follows memory through the exchanges and the rollback; the overlay undoes it all.
+    system.GPU().OpenOverlay();
     section->Exchange();
     replay->Clear();
     replay->Arm(*process);
@@ -327,6 +330,7 @@ SectionReplay::Result SectionReplay::Replay(std::span<const Input> inputs,
     result.held_reads = replay->HeldReads();
     replay->Rollback();
     section->Exchange();
+    system.GPU().CloseOverlay();
     cpu.LoadContext(end_context);
     cpu.ClearExclusiveState();
     result.host_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(

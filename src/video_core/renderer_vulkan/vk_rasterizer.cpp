@@ -842,6 +842,18 @@ bool RasterizerVulkan::MakeInBetween(const Pica::DisplayTransferConfig& config, 
     return in_between.due;
 }
 
+void RasterizerVulkan::OpenOverlay() {
+    res_cache.OpenOverlay();
+}
+
+void RasterizerVulkan::CloseOverlay() {
+    res_cache.CloseOverlay();
+}
+
+VideoCore::CacheState RasterizerVulkan::CaptureCacheState() {
+    return res_cache.CaptureState();
+}
+
 bool RasterizerVulkan::TakeInBetween(u32 screen, PAddr framebuffer_addr, bool first_show,
                                      ScreenInfo& screen_info) {
     InBetween& in_between = in_betweens.at(screen);

@@ -75,6 +75,15 @@ public:
         return SlotId{index};
     }
 
+    /// Exchanges the objects in two slots; ids keep naming their slots
+    void swap(SlotId a, SlotId b) noexcept {
+        T held(std::move(values[a.index].object));
+        values[a.index].object.~T();
+        new (&values[a.index].object) T(std::move(values[b.index].object));
+        values[b.index].object.~T();
+        new (&values[b.index].object) T(std::move(held));
+    }
+
     void erase(SlotId id) noexcept {
         values[id.index].object.~T();
         free_list.push_back(id.index);

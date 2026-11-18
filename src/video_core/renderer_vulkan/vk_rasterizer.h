@@ -65,6 +65,9 @@ public:
     /// `framebuffer_addr` again, until the frame it leads to shows
     bool TakeInBetween(u32 screen, PAddr framebuffer_addr, bool first_show,
                        ScreenInfo& screen_info);
+    void OpenOverlay() override;
+    void CloseOverlay() override;
+    VideoCore::CacheState CaptureCacheState() override;
     bool AccelerateDrawBatch(bool is_indexed) override;
 
     /// Switches the disk resources to the specified title

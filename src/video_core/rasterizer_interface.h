@@ -6,6 +6,8 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
+#include <string>
 #include "common/common_types.h"
 
 namespace Pica {
@@ -18,6 +20,10 @@ struct MemoryFillConfig;
 } // namespace Pica
 
 namespace VideoCore {
+
+/// The cache's tracked state for a leak check, one line per surface, dirty interval, cached page
+/// run and texture cube, keyed by what the line describes
+using CacheState = std::map<std::string, std::string>;
 
 enum class LoadCallbackStage {
     Prepare,
@@ -65,6 +71,16 @@ public:
     /// output memory alone; it stands in for the frame before the one that will show at `shown_at`
     virtual bool MakeInBetween(const Pica::DisplayTransferConfig&, u32 screen, PAddr shown_at) {
         return false;
+    }
+
+    /// Opens and closes the overlay a replay's GPU work runs in: the cache's state at the close is
+    /// its state at the open, and the replay's draws land in copies
+    virtual void OpenOverlay() {}
+    virtual void CloseOverlay() {}
+
+    /// Reads the cache's tracked state back, surface contents included; slow, for checks only
+    virtual CacheState CaptureCacheState() {
+        return {};
     }
 
     /// Attempt to use a faster method to perform a display transfer with is_texture_copy = 1

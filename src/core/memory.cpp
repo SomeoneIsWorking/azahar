@@ -812,6 +812,21 @@ void MemorySystem::SetStoreJournal(StoreJournal* journal) {
     impl->journal = journal;
 }
 
+void MemorySystem::JournalPhysicalStore(PAddr address, u32 size) {
+    if (impl->journal == nullptr || size == 0) [[likely]] {
+        return;
+    }
+    const PAddr last = (address + size - 1) & ~CITRA_PAGE_MASK;
+    for (PAddr page = address & ~CITRA_PAGE_MASK; page <= last; page += CITRA_PAGE_SIZE) {
+        u8* host = GetPhysicalPointer(page);
+        if (host == nullptr) {
+            continue;
+        }
+        const std::vector<VAddr> vaddrs = PhysicalToVirtualAddressForRasterizer(page);
+        impl->journal->Save(host, vaddrs.empty() ? 0 : vaddrs.front());
+    }
+}
+
 void MemorySystem::SetWriteObserver(WriteObserver observer) {
     impl->write_observer = std::move(observer);
 }

@@ -10,6 +10,7 @@
 #include <boost/serialization/access.hpp>
 
 #include "core/hle/service/gsp/gsp_interrupt.h"
+#include "video_core/rasterizer_interface.h"
 
 namespace Service::GSP {
 struct Command;
@@ -64,11 +65,26 @@ public:
     /// Executes the provided GSP command.
     void Execute(const Service::GSP::Command& command);
 
-    /// Runs GSP commands beside the game's own: no interrupts are signalled, the PICA state is put
-    /// back afterwards, and a display transfer to a screen's framebuffer makes that screen's
-    /// in-between image (RasterizerInterface::MakeInBetween) instead of writing guest memory.
-    /// Returns the number of in-betweens made.
-    u32 RunDetached(std::span<const Service::GSP::Command> commands);
+    /// What RunDetached did.
+    struct DetachedRun {
+        u32 in_betweens = 0;
+        /// Fills and transfers the rasterizer cache could not run, which are not run in software.
+        u32 skipped = 0;
+    };
+
+    /// Runs GSP commands beside the game's own, inside the overlay (OpenOverlay): no interrupts
+    /// are signalled, the PICA state is put back afterwards, and a display transfer to a screen's
+    /// framebuffer makes that screen's in-between image (RasterizerInterface::MakeInBetween)
+    /// instead of writing guest memory.
+    DetachedRun RunDetached(std::span<const Service::GSP::Command> commands);
+
+    /// Opens and closes the rasterizer cache's overlay (RasterizerInterface::OpenOverlay) around
+    /// a replay, its CPU part and RunDetached both.
+    void OpenOverlay();
+    void CloseOverlay();
+
+    /// The rasterizer cache's tracked state read back, for a leak check of RunDetached.
+    CacheState CaptureCacheState();
 
     /// Updates GPU display framebuffer configuration using the specified parameters.
     void SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
