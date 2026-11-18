@@ -166,12 +166,12 @@ private:
 
 private:
     const Core::System& system;
-    PlayMode play_mode;
+    PlayMode play_mode = PlayMode::None;
 
     std::string record_movie_file;
     std::string record_movie_author;
 
-    u64 init_time;       // Clock init time override for RNG consistency
+    u64 init_time = 0;   // Clock init time override for RNG consistency
     s64 base_ticks = -1; // Core timing base system ticks override for RNG consistency
 
     std::vector<u8> recorded_input;
