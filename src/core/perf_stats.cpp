@@ -114,6 +114,13 @@ void PerfStats::EndGameFrame() {
     PerfStats::game_frames_updated = true;
 }
 
+void PerfStats::AddWindowPresent(bool in_between) {
+    std::scoped_lock lock{object_mutex};
+
+    window_presents += 1;
+    in_between_presents += in_between ? 1 : 0;
+}
+
 double PerfStats::GetMeanFrametime() const {
     std::scoped_lock lock{object_mutex};
 
@@ -137,6 +144,8 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
 
     last_stats.system_fps = static_cast<double>(system_frames) / interval;
     last_stats.game_fps = static_cast<double>(game_frames) / interval;
+    last_stats.window_present_fps = static_cast<double>(window_presents) / interval;
+    last_stats.in_between_present_fps = static_cast<double>(in_between_presents) / interval;
     last_stats.time_vblank_interval =
         system_frames ? (duration_cast<DoubleSecs>(accumulated_frametime).count() /
                          static_cast<double>(system_frames))
@@ -179,6 +188,8 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
     accumulated_gpu_time = Clock::duration::zero();
     accumulated_swap_time = Clock::duration::zero();
     game_frames = 0;
+    window_presents = 0;
+    in_between_presents = 0;
     artic_transmitted = 0;
     prev_artic_event.raw &= artic_events.raw;
 

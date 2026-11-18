@@ -55,6 +55,10 @@ public:
         double system_fps;
         /// Game FPS (GSP frame submissions) in Hz
         double game_fps;
+        /// Presents to the main window in Hz
+        double window_present_fps;
+        /// Presents to the main window that showed a section replay's in-between, in Hz
+        double in_between_present_fps;
         /// Walltime in seconds, between guest vblank events
         double time_vblank_interval;
         // Walltime in seconds of the vblank interval spent in SVC processing, excluding GPU and IPC
@@ -87,6 +91,7 @@ public:
     void BeginSystemFrame();
     void EndSystemFrame();
     void EndGameFrame();
+    void AddWindowPresent(bool in_between);
 
     Results GetAndResetStats(std::chrono::microseconds current_system_time_us);
 
@@ -146,6 +151,9 @@ private:
     u32 system_frames = 0;
     /// Cumulative number of game frames (GSP frame submissions) since last reset
     u32 game_frames = 0;
+    /// Presents to the main window since last reset, and those that showed an in-between
+    u32 window_presents = 0;
+    u32 in_between_presents = 0;
     /// Cumulative number of transmitted artic base traffic
     std::atomic<u32> artic_transmitted = 0;
     // System events that affect performance
