@@ -68,6 +68,7 @@ void SectionReplay::Reset() {
     pending = false;
     window_cpu = nullptr;
     replaying = false;
+    pending_leads.clear();
 }
 
 bool SectionReplay::Install(VAddr open_site_, VAddr close_site_, Handler handler_) {
@@ -91,13 +92,21 @@ bool SectionReplay::Install(VAddr open_site_, VAddr close_site_, Handler handler
 }
 
 bool SectionReplay::Observe(VAddr site) {
+    return AddHook(site, Hook::Observe);
+}
+
+bool SectionReplay::ObserveLead(VAddr site) {
+    return AddHook(site, Hook::ObserveLead);
+}
+
+bool SectionReplay::AddHook(VAddr site, Hook hook) {
     if (open_site == 0 || !DecodeBranch(site, system.Memory().Read32(site))) {
         LOG_ERROR(Core,
                   "observed site {:08X} is not an ARM B, BL or BLX, or no section is installed",
                   site);
         return false;
     }
-    hooks[site] = Hook::Observe;
+    hooks[site] = hook;
     observed_sites.push_back(site);
     for (u32 core = 0; core < system.GetNumCores(); ++core) {
         system.GetCore(core).InvalidateCacheRange(site, 4);
@@ -118,6 +127,7 @@ void SectionReplay::Uninstall() {
         }
     }
     observed_sites.clear();
+    pending_leads.clear();
     open_site = 0;
     close_site = 0;
     handler = nullptr;
@@ -158,6 +168,7 @@ bool SectionReplay::OnSvc(ARM_Interface& cpu, u32 immediate) {
         case Hook::Open:
         case Hook::Close:
         case Hook::Observe:
+        case Hook::ObserveLead:
             AtSite(cpu, hook);
             break;
         default:
@@ -234,15 +245,26 @@ void SectionReplay::AtSite(ARM_Interface& cpu, Hook hook) {
     ASSERT(branch);
     const VAddr target = branch->reg ? cpu.GetReg(*branch->reg) : branch->target;
     ASSERT_MSG((target & 1) == 0, "section site {:08X} branches to Thumb", site);
+    if (hook == Hook::Open && replaying) {
+        NextLead(cpu);
+        return;
+    }
+    const Call call{site, target, {cpu.GetReg(0), cpu.GetReg(1), cpu.GetReg(2), cpu.GetReg(3)}};
     if (hook == Hook::Observe && window_open && !replaying && OnWindowThread(cpu)) {
-        census.calls.push_back(
-            {site, {cpu.GetReg(0), cpu.GetReg(1), cpu.GetReg(2), cpu.GetReg(3)}});
+        census.calls.push_back(call);
+    }
+    if (hook == Hook::ObserveLead && !window_open && !replaying) {
+        const Kernel::Thread* thread =
+            system.Kernel().GetThreadManager(cpu.GetID()).GetCurrentThread();
+        if (thread != nullptr) {
+            pending_leads.emplace_back(call, thread->GetThreadId());
+        }
     }
     if (branch->link) {
         cpu.SetReg(14, site + 4);
     }
     cpu.SetPC(target);
-    if (hook == Hook::Observe) {
+    if (hook == Hook::Observe || hook == Hook::ObserveLead) {
         return;
     }
     if (hook == Hook::Close) {
@@ -267,6 +289,12 @@ bool SectionReplay::OpenWindow(ARM_Interface& cpu) {
     }
     census = {};
     window_thread = thread->GetThreadId();
+    for (const auto& [call, caller] : pending_leads) {
+        if (caller == window_thread) {
+            census.lead_calls.push_back(call);
+        }
+    }
+    pending_leads.clear();
     window_cpu = &cpu;
     section->Clear();
     section->Arm(*process);
@@ -318,7 +346,21 @@ void SectionReplay::SetJournal(Memory::StoreJournal* journal) {
     system.Memory().SetStoreJournal(journal);
 }
 
+void SectionReplay::NextLead(ARM_Interface& cpu) {
+    if (next_lead == leads.size()) {
+        cpu.LoadContext(start_context);
+        return;
+    }
+    const Call& call = leads[next_lead++];
+    for (u32 i = 0; i < call.args.size(); ++i) {
+        cpu.SetReg(i, call.args[i]);
+    }
+    cpu.SetReg(14, open_site);
+    cpu.SetPC(call.target);
+}
+
 SectionReplay::Result SectionReplay::Replay(std::span<const Input> inputs,
+                                            std::span<const Call> leads_,
                                             const std::function<void()>& capture) {
     Result result;
     const auto process = system.Kernel().GetCurrentProcess();
@@ -347,10 +389,16 @@ SectionReplay::Result SectionReplay::Replay(std::span<const Input> inputs,
     stopped = false;
     refusal.clear();
     replay_ticks = 0;
+    leads = leads_;
+    next_lead = 0;
+    if (!leads.empty()) {
+        NextLead(cpu);
+    }
     while (!stopped) {
         cpu.Run();
     }
     replaying = false;
+    leads = {};
 
     result.instructions = replay_ticks;
     result.refusal = refusal;

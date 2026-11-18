@@ -33,8 +33,10 @@ class System;
 // runs for real a store journal saves every page written. When it ends, outside the JIT, the
 // handler may replay the section any number of times from the state it started in, with inputs
 // written over that state; each replay's stores are journalled and rolled back and guest time is
-// held. In a replay an ArbitrateAddress signal and SleepThread do nothing, gsp::Gpu's
-// FlushDataCache is answered without the GSP, and any other SVC or a CPU exception refuses it.
+// held. A replay may first run calls the tick made before the section (leads), so that state the
+// section only reads is derived again from the inputs. In a replay an ArbitrateAddress signal and
+// SleepThread do nothing, gsp::Gpu's FlushDataCache is answered without the GSP, and any other SVC
+// or a CPU exception refuses it.
 class SectionReplay {
 public:
     // A hook is the instruction run as `svc` with an immediate this far above the kernel's.
@@ -65,16 +67,18 @@ public:
         // Made by another thread while the section's thread waited.
         bool other_thread = false;
     };
-    // A call through an observed branch site while the real section ran, with its first four
-    // arguments.
+    // A call through an observed branch site, where it went and its first four arguments.
     struct Call {
         VAddr site;
+        VAddr target;
         std::array<u32, 4> args;
     };
     // What the real section reached besides memory: each SVC it made, in order.
     struct Census {
         std::vector<Svc> svcs;
         std::vector<Call> calls;
+        // The calls the section's thread made through a lead site since the section before.
+        std::vector<Call> lead_calls;
         std::size_t pages = 0;
         u64 held_reads = 0;
         // Host time from the call to the return, other threads' slices included.
@@ -91,11 +95,17 @@ public:
     bool Install(VAddr open_site, VAddr close_site, Handler handler);
     // Records the calls the real section makes through a branch site (SectionCensus().calls).
     bool Observe(VAddr site);
+    // Records the calls the section's thread makes through a branch site before the section
+    // (SectionCensus().lead_calls): work of the tick that a replay may need to run again.
+    bool ObserveLead(VAddr site);
     void Uninstall();
 
     // Inside the handler. Replays the section from its starting state with `inputs` written, calls
-    // `capture` while the replay's memory is in place, and puts everything back.
-    Result Replay(std::span<const Input> inputs, const std::function<void()>& capture);
+    // `capture` while the replay's memory is in place, and puts everything back. Each of `leads`
+    // is called first, in order, from the section's starting state, each returning to the open
+    // site; the section then starts with the registers it started with.
+    Result Replay(std::span<const Input> inputs, std::span<const Call> leads,
+                  const std::function<void()>& capture);
     [[nodiscard]] const Census& SectionCensus() const {
         return census;
     }
@@ -132,11 +142,14 @@ public:
     void Reset();
 
 private:
-    enum class Hook : u32 { Open, Close, Observe };
+    enum class Hook : u32 { Open, Close, Observe, ObserveLead };
     static constexpr u64 ReplayTickLimit = 400'000'000;
 
     void AtSite(ARM_Interface& cpu, Hook hook);
     bool OpenWindow(ARM_Interface& cpu);
+    bool AddHook(VAddr site, Hook hook);
+    // In a replay: calls the next lead, or starts the section once they have all returned.
+    void NextLead(ARM_Interface& cpu);
     void CloseWindow(ARM_Interface& cpu);
     [[nodiscard]] bool OnWindowThread(ARM_Interface& cpu) const;
     void Stop(ARM_Interface& cpu, std::string refusal);
@@ -154,6 +167,8 @@ private:
     std::unique_ptr<Memory::StoreJournal> section;
     std::unique_ptr<Memory::StoreJournal> replay;
     Census census;
+    // Lead calls not yet claimed by a section, with the thread that made each.
+    std::vector<std::pair<Call, u32>> pending_leads;
     bool window_open = false;
     bool pending = false;
     u32 window_thread = 0;
@@ -163,6 +178,8 @@ private:
 
     bool replaying = false;
     bool stopped = false;
+    std::span<const Call> leads;
+    std::size_t next_lead = 0;
     std::string refusal;
     u64 replay_ticks = 0;
 };
