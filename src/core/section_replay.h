@@ -57,6 +57,8 @@ public:
     struct Svc {
         u32 number;
         VAddr pc;
+        // The return address of the call that reached it.
+        VAddr lr;
         std::string service;
         u32 detail = 0;
         VAddr address = 0;

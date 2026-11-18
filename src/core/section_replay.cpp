@@ -126,7 +126,7 @@ SectionReplay::Svc SectionReplay::DescribeSvc(ARM_Interface& cpu, const Kernel::
                                               u32 immediate) {
     constexpr u32 SendSyncRequest = 0x32;
     constexpr VAddr CommandBuffer = 0x80;
-    Svc svc{immediate, cpu.GetPC() - 4, {}, 0, 0};
+    Svc svc{immediate, cpu.GetPC() - 4, cpu.GetReg(14), {}, 0, 0};
     if (immediate == ArbitrateAddress) {
         svc.address = cpu.GetReg(1);
         svc.detail = cpu.GetReg(2);
