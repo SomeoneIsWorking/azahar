@@ -33,8 +33,8 @@ class System;
 // runs for real a store journal saves every page written. When it ends, outside the JIT, the
 // handler may replay the section any number of times from the state it started in, with inputs
 // written over that state; each replay's stores are journalled and rolled back and guest time is
-// held. An ArbitrateAddress signal does nothing in a replay; any other SVC or a CPU exception
-// refuses it.
+// held. In a replay an ArbitrateAddress signal and SleepThread do nothing, gsp::Gpu's
+// FlushDataCache is answered without the GSP, and any other SVC or a CPU exception refuses it.
 class SectionReplay {
 public:
     // A hook is the instruction run as `svc` with an immediate this far above the kernel's.
@@ -141,6 +141,7 @@ private:
     [[nodiscard]] bool OnWindowThread(ARM_Interface& cpu) const;
     void Stop(ARM_Interface& cpu, std::string refusal);
     Svc DescribeSvc(ARM_Interface& cpu, const Kernel::Thread& thread, u32 immediate);
+    bool AnswerFlushDataCache(ARM_Interface& cpu);
     void SetJournal(Memory::StoreJournal* journal);
 
     System& system;

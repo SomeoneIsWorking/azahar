@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
 #include <fmt/format.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -20,7 +21,15 @@
 namespace Core {
 namespace {
 
+constexpr u32 SleepThread = 0x0A;
 constexpr u32 ArbitrateAddress = 0x22;
+constexpr u32 SendSyncRequest = 0x32;
+// The IPC command buffer in a thread's TLS.
+constexpr VAddr CommandBuffer = 0x80;
+// gsp::Gpu FlushDataCache's request header and its reply's.
+constexpr std::string_view GspSession = "gsp::Gpu_Server_Client";
+constexpr u32 FlushDataCacheRequest = 0x00080082;
+constexpr u32 FlushDataCacheReply = 0x00080040;
 
 // ARM B, BL or BLX register, always executed.
 struct Branch {
@@ -124,8 +133,6 @@ std::optional<u32> SectionReplay::CodeAt(VAddr vaddr) const {
 
 SectionReplay::Svc SectionReplay::DescribeSvc(ARM_Interface& cpu, const Kernel::Thread& thread,
                                               u32 immediate) {
-    constexpr u32 SendSyncRequest = 0x32;
-    constexpr VAddr CommandBuffer = 0x80;
     Svc svc{immediate, cpu.GetPC() - 4, cpu.GetReg(14), {}, 0, 0};
     if (immediate == ArbitrateAddress) {
         svc.address = cpu.GetReg(1);
@@ -166,6 +173,13 @@ bool SectionReplay::OnSvc(ARM_Interface& cpu, u32 immediate) {
             cpu.SetReg(0, 0);
             return true;
         }
+        // No other thread runs in a replay and its time is held: a sleep only returns.
+        if (immediate == SleepThread) {
+            return true;
+        }
+        if (immediate == SendSyncRequest && AnswerFlushDataCache(cpu)) {
+            return true;
+        }
         Stop(cpu, fmt::format("svc 0x{:02X} at {:08X}", immediate, cpu.GetPC() - 4));
         return true;
     }
@@ -176,6 +190,27 @@ bool SectionReplay::OnSvc(ARM_Interface& cpu, u32 immediate) {
         census.svcs.push_back(std::move(svc));
     }
     return false;
+}
+
+bool SectionReplay::AnswerFlushDataCache(ARM_Interface& cpu) {
+    // The GSP answers FlushDataCache and changes nothing; a replay's GPU run reads memory as the
+    // replay left it.
+    const Kernel::Thread* thread = system.Kernel().GetThreadManager(cpu.GetID()).GetCurrentThread();
+    if (thread == nullptr) {
+        return false;
+    }
+    const auto session =
+        thread->owner_process.lock()->handle_table.Get<Kernel::ClientSession>(cpu.GetReg(0));
+    const VAddr buffer = thread->GetTLSAddress() + CommandBuffer;
+    Memory::MemorySystem& memory = system.Memory();
+    if (!session || session->GetName() != GspSession ||
+        memory.Read32(buffer) != FlushDataCacheRequest) {
+        return false;
+    }
+    memory.Write32(buffer, FlushDataCacheReply);
+    memory.Write32(buffer + 4, 0);
+    cpu.SetReg(0, 0);
+    return true;
 }
 
 bool SectionReplay::OnWindowThread(ARM_Interface& cpu) const {
