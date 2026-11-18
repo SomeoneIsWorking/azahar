@@ -1049,6 +1049,10 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     if ((slot_surfaces[surface_id].invalid_regions & validate_interval).empty()) {
         return;
     }
+    // A replay draws a custom image as the real frame bound it, never uploading over it.
+    if (overlay && slot_surfaces[surface_id].IsCustom()) {
+        return;
+    }
     PrepareWrite(surface_id);
     SurfaceRegions validate_regions = slot_surfaces[surface_id].invalid_regions & validate_interval;
 
@@ -1164,6 +1168,11 @@ u64 RasterizerCache<T>::ComputeHash(const SurfaceParams& load_info, std::span<u8
 template <class T>
 bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
+    // A replay starts no decode and shows no custom image the real frame has not bound: a surface
+    // without one takes the guest's image, as the real frame's first validation of it does.
+    if (overlay) {
+        return false;
+    }
 
     Surface& surface = slot_surfaces[surface_id];
     const SurfaceParams load_info = surface.FromInterval(interval);
@@ -1206,10 +1215,6 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
         }
         return true;
     };
-    // A decode finishing after the overlay closes would upload into the surface it put back.
-    if (overlay) {
-        return material->IsDecoded() && upload();
-    }
     return custom_tex_manager.Decode(material, std::move(upload));
 }
 
