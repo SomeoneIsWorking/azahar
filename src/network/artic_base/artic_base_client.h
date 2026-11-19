@@ -13,6 +13,7 @@
 #include "string"
 #include "thread"
 #include "utility"
+#include "vector"
 
 #include "artic_base_common.h"
 #include "network/socket_manager.h"
