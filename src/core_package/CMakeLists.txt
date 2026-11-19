@@ -10,6 +10,10 @@ if (APPLE)
     # this tree does not link.
     target_link_libraries(azahar_core PRIVATE "-framework AppKit" "-framework Foundation" "-framework CoreGraphics")
 endif()
+if (MINGW)
+    # A DLL exports only what it is told to; the frontend links the core's whole C++ API, as on ELF.
+    target_link_options(azahar_core PRIVATE "-Wl,--export-all-symbols")
+endif()
 
 get_directory_property(core_definitions COMPILE_DEFINITIONS)
 target_compile_definitions(azahar_core INTERFACE ${core_definitions})
