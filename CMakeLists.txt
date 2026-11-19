@@ -28,7 +28,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     enable_language(OBJC OBJCXX)
 endif()
 
-if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND MINGW)
+# MXE cross builds name their archiver by LIBTYPE; other MinGW toolchains (llvm-mingw) bring their own.
+if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND MINGW AND DEFINED LIBTYPE)
     string(TOLOWER ${LIBTYPE} LIBTYPE_LOWER)
     set(CMAKE_AR x86_64-w64-mingw32.${LIBTYPE_LOWER}-gcc-ar)
 endif()
