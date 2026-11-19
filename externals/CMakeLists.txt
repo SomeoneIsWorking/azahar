@@ -324,6 +324,10 @@ else()
     # LibreSSL
     set(LIBRESSL_SKIP_INSTALL ON CACHE BOOL "")
     set(OPENSSLDIR "/etc/ssl/")
+    if (MINGW)
+        # libressl's Windows shim defines htobe32 and kin only when it is told there is no endian.h.
+        set(HAVE_ENDIAN_H OFF CACHE INTERNAL "")
+    endif()
     add_subdirectory(libressl EXCLUDE_FROM_ALL)
     target_include_directories(ssl INTERFACE ./libressl/include)
     target_disable_warnings(ssl)
