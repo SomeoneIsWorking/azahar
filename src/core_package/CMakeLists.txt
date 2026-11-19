@@ -31,7 +31,8 @@ install(FILES "${PROJECT_SOURCE_DIR}/externals/microprofile/microprofile.h"
     DESTINATION "${include_dir}")
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/externals/xbyak/xbyak" DESTINATION "${include_dir}" ${header_patterns})
 
-install(TARGETS azahar_core EXPORT AzaharCoreTargets LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+install(TARGETS azahar_core EXPORT AzaharCoreTargets LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 set(package_dir "${CMAKE_INSTALL_LIBDIR}/cmake/AzaharCore")
 install(EXPORT AzaharCoreTargets NAMESPACE AzaharCore:: DESTINATION "${package_dir}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/AzaharCoreConfig.cmake"
